@@ -1,22 +1,38 @@
-﻿太炅 Lotto Lab Ultimate v5.0 업로드 순서
+﻿太炅 Lotto Lab Ultimate v5.1 정상 폴더구조 업로드 안내
 
-1. ZIP 압축을 풉니다.
-2. 압축을 풀면 아래 항목이 바로 보여야 합니다.
-   - Windows
-   - Android
-   - .github
-   - README.md
-3. 새 저장소 Taegyeong-Lotto-Lab-Ultimate-v2에서
-   uploading an existing file 을 클릭합니다.
-4. 위 4개 항목을 모두 선택해 업로드합니다.
-5. Commit changes를 누릅니다.
-6. Actions 탭에서 다음 두 작업을 확인합니다.
-   - Windows EXE 자동 빌드
-   - Android APK 자동 빌드
-7. 초록색 체크 후 각 실행을 열고 Artifacts에서 다운로드합니다.
+이번 파일의 정상 구조:
+
+Taegyeong_Lotto_Lab_Ultimate_v5.1
+├─ Android
+├─ Windows
+├─ .github
+│  └─ workflows
+│     ├─ android-build.yml
+│     └─ windows-build.yml
+├─ README.md
+├─ 업로드순서.txt
+└─ 업로드전_확인.bat
 
 중요
-- ZIP 파일 자체를 올리면 안 됩니다.
-- 반드시 압축을 푼 내부 파일과 폴더를 올리세요.
-- .github 폴더가 숨김 폴더라 안 보이면 파일 탐색기에서
-  보기 → 숨긴 항목을 체크하세요.
+- GitHub 업로드 화면에는 폴더 이름이 아니라 내부 파일 경로가 표시될 수 있습니다.
+- 예: /Android/app/... 또는 /.github/workflows/android-build.yml
+- 이것은 정상입니다.
+- 반드시 /.github/workflows/android-build.yml
+  그리고 /.github/workflows/windows-build.yml
+  두 경로가 보여야 합니다.
+
+업로드 순서
+1. ZIP 압축을 풉니다.
+2. 압축 푼 폴더 안에서 Ctrl+A를 눌러 전체 선택합니다.
+3. 선택한 항목 전체를 GitHub의 uploading an existing file 화면으로 드래그합니다.
+4. 목록에서 아래 두 줄이 보이는지 확인합니다.
+   /.github/workflows/android-build.yml
+   /.github/workflows/windows-build.yml
+5. Commit changes를 누릅니다.
+6. Actions 탭으로 이동합니다.
+7. Android APK 자동 빌드 / Windows EXE 자동 빌드가 보여야 정상입니다.
+
+주의
+- 파일 선택창의 'choose your files'는 폴더 구조가 풀릴 수 있으니,
+  Windows 탐색기에서 전체 선택 후 드래그 방식이 가장 안전합니다.
+- 이미 잘못 올라간 저장소보다 새 v3 저장소에 올리는 것이 안전합니다.
