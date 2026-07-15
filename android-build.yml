@@ -1,0 +1,57 @@
+name: Android APK 자동 빌드
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Android/**"
+      - ".github/workflows/android-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Android
+
+    steps:
+      - name: 저장소 받기
+        uses: actions/checkout@v4
+
+      - name: Java 17 설치
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK 설치
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle 8.7 준비
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Android SDK 구성
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: APK 빌드
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: APK 이름 변경
+        run: cp app/build/outputs/apk/debug/app-debug.apk TaegyeongLottoLab-Android-v5.1.apk
+
+      - name: APK 다운로드 등록
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaegyeongLottoLab-Android-v5.1
+          path: Android/TaegyeongLottoLab-Android-v5.1.apk
+          if-no-files-found: error
+          retention-days: 30
