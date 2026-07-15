@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "5.4.0"
+VERSION = "5.5.0"
 
 
 
@@ -263,6 +263,68 @@ class Recommender:
         ]
         details.sort(key=lambda item: (-item[1], item[0]))
         return details[:top_n]
+
+    def triple_details(self, combo: tuple[int, ...], top_n: int = 3):
+        details = [
+            (triple, self.a.triple_counts[triple])
+            for triple in combinations(combo, 3)
+        ]
+        details.sort(key=lambda item: (-item[1], item[0]))
+        return details[:top_n]
+
+    @staticmethod
+    def confidence_score(score: float, metrics: dict[str, float]) -> float:
+        """0~100 추천 신뢰도. 통계점수와 조합 균형을 함께 반영합니다."""
+        base = min(100.0, max(0.0, score))
+        stability = (
+            metrics.get("pair", 0.0) * 0.25
+            + metrics.get("triple", 0.0) * 0.20
+            + metrics.get("recent", 0.0) * 0.20
+            + metrics.get("structure", 0.0) * 0.20
+            + metrics.get("input", 0.0) * 0.15
+        )
+        return round(min(100.0, base * 0.65 + stability * 0.35), 1)
+
+    @staticmethod
+    def confidence_grade(confidence: float) -> str:
+        if confidence >= 95:
+            return "S"
+        if confidence >= 90:
+            return "A"
+        if confidence >= 80:
+            return "B"
+        if confidence >= 70:
+            return "C"
+        return "D"
+
+    @staticmethod
+    def select_diverse(
+        candidates: list[tuple[float, tuple[int, ...], dict[str, float]]],
+        count: int,
+    ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
+        """서로 너무 비슷한 조합을 줄여 결과 다양성을 높입니다."""
+        selected = []
+        selected_sets = []
+
+        # 1차: 기존 조합과 5개 이상 겹치는 후보는 제외
+        for row in candidates:
+            combo_set = set(row[1])
+            if all(len(combo_set & prev) <= 4 for prev in selected_sets):
+                selected.append(row)
+                selected_sets.append(combo_set)
+                if len(selected) >= count:
+                    return selected
+
+        # 2차: 부족하면 점수순으로 남은 조합을 보충
+        existing = {row[1] for row in selected}
+        for row in candidates:
+            if row[1] in existing:
+                continue
+            selected.append(row)
+            existing.add(row[1])
+            if len(selected) >= count:
+                break
+        return selected
 
     @staticmethod
     def _normalize(value: float, maximum: float) -> float:
@@ -712,7 +774,7 @@ class Recommender:
                     break
 
         candidates.sort(key=lambda x: (-x[0], x[1]))
-        return candidates[:count]
+        return self.select_diverse(candidates, count)
 
 
 class MainWindow(QMainWindow):
@@ -958,16 +1020,25 @@ class MainWindow(QMainWindow):
         self.rec_status.setObjectName("card")
         lay.addWidget(self.rec_status)
 
-        self.rec_table = QTableWidget(0, 10)
+        self.rec_table = QTableWidget(0, 13)
         self.rec_table.setHorizontalHeaderLabels(
             [
-                "순위", "추천조합", "카테고리 점수", "종합 점수",
-                "나온횟수", "동반수", "트리플", "최근패턴",
-                "같이 잘 나온 수", "합계"
+                "순위", "추천조합", "추천 이유", "신뢰도", "등급",
+                "카테고리 점수", "종합 점수", "나온횟수", "동반수",
+                "트리플", "최근패턴", "동반출현 횟수", "합계"
             ]
         )
         self.rec_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.rec_table.cellClicked.connect(self.show_recommend_detail)
         lay.addWidget(self.rec_table)
+
+        self.detail_box = QPlainTextEdit()
+        self.detail_box.setReadOnly(True)
+        self.detail_box.setPlaceholderText(
+            "추천조합을 클릭하면 동반출현·트리플·점수 상세가 표시됩니다."
+        )
+        self.detail_box.setMaximumHeight(170)
+        lay.addWidget(self.detail_box)
 
         export = QPushButton("현재 순위 Excel 저장")
         export.clicked.connect(self.export_results)
@@ -1376,10 +1447,15 @@ class MainWindow(QMainWindow):
                     candidate_numbers,
                     combo,
                 )
+                confidence = recommender.confidence_score(score, metrics)
+                grade = recommender.confidence_grade(confidence)
+                rank_text = f"TOP {r}" if r <= 10 else str(r)
                 values = [
-                    str(r),
+                    rank_text,
                     " · ".join(map(str, combo)),
                     reason,
+                    f"{confidence:.1f}",
+                    grade,
                     f"{score:.1f}",
                     f"{metrics['composite']:.1f}",
                     f"{metrics['input']:.1f}",
@@ -1394,8 +1470,8 @@ class MainWindow(QMainWindow):
 
                 # 현재 선택한 카테고리의 점수 칸을 강조
                 metric_column = {
-                    "composite": 4, "input": 5, "pair": 6,
-                    "triple": 7, "recent": 8, "self": 3,
+                    "composite": 6, "input": 7, "pair": 8,
+                    "triple": 9, "recent": 10, "self": 5,
                 }[selected_key]
                 metric_value = metrics.get(selected_key, score)
                 item = self.rec_table.item(r - 1, metric_column)
@@ -1407,6 +1483,12 @@ class MainWindow(QMainWindow):
                     color = QColor("#5A3A3A")
                 item.setBackground(QBrush(color))
                 item.setForeground(QBrush(QColor("#FFFFFF")))
+
+                if r <= 10:
+                    for top_col in range(self.rec_table.columnCount()):
+                        top_item = self.rec_table.item(r - 1, top_col)
+                        if top_item is not None:
+                            top_item.setBackground(QBrush(QColor("#3A3215")))
 
                 combo_item = self.rec_table.item(r - 1, 1)
                 if metric_value >= 70:
@@ -1426,7 +1508,7 @@ class MainWindow(QMainWindow):
 
             self.rec_status.setText(
                 f"{category} 기준 {len(self.recommendations)}조합 계산 완료 · "
-                f"적용 필터: {filter_text}"
+                f"적용 필터: {filter_text} · 유사조합 자동분산 적용"
             )
             self.statusBar().showMessage(
                 f"{category} 추천 {len(self.recommendations)}개 완료"
@@ -1434,6 +1516,53 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "추천 오류", str(e))
 
+
+    def show_recommend_detail(self, row: int, _column: int) -> None:
+        if row < 0 or row >= len(self.recommendations):
+            return
+
+        recommender = Recommender(self.analyzer)
+        score, combo, metrics = self.recommendations[row]
+        category = self.rec_category.currentText()
+
+        if category == "자체추천":
+            fixed_numbers = ()
+            candidate_numbers = ()
+        else:
+            fixed_numbers = self.fixed_numbers()
+            candidate_numbers = self.candidate_numbers()
+
+        confidence = recommender.confidence_score(score, metrics)
+        grade = recommender.confidence_grade(confidence)
+        reason = recommender.recommendation_reason(
+            metrics, fixed_numbers, candidate_numbers, combo
+        )
+
+        pair_lines = [
+            f"{a}↔{b}: {count}회"
+            for (a, b), count in recommender.pair_details(combo, 5)
+        ]
+        triple_lines = [
+            f"{a}-{b}-{c}: {count}회"
+            for (a, b, c), count in recommender.triple_details(combo, 5)
+        ]
+
+        text = (
+            f"추천조합: {' · '.join(map(str, combo))}\n"
+            f"추천신뢰도: {confidence:.1f}점 ({grade}등급)\n"
+            f"추천이유: {reason}\n"
+            f"합계: {sum(combo)} / 홀수 {sum(n % 2 for n in combo)}개 / "
+            f"고번호 {sum(n >= 23 for n in combo)}개\n\n"
+            f"[동반출현 횟수]\n" + "\n".join(pair_lines) +
+            f"\n\n[트리플 출현 횟수]\n" + "\n".join(triple_lines) +
+            f"\n\n[세부 점수]\n"
+            f"나온횟수 {metrics.get('input', 0):.1f} / "
+            f"동반수 {metrics.get('pair', 0):.1f} / "
+            f"트리플 {metrics.get('triple', 0):.1f} / "
+            f"최근패턴 {metrics.get('recent', 0):.1f} / "
+            f"조합균형 {metrics.get('structure', 0):.1f}"
+        )
+        self.detail_box.setPlainText(text)
 
     def export_results(self) -> None:
         if not self.recommendations:
@@ -1477,6 +1606,10 @@ class MainWindow(QMainWindow):
                     candidate_numbers,
                     combo,
                 ),
+                "추천신뢰도": recommender.confidence_score(score, metrics),
+                "등급": recommender.confidence_grade(
+                    recommender.confidence_score(score, metrics)
+                ),
                 "카테고리점수": round(score, 1),
                 "종합점수": round(metrics["composite"], 1),
                 "입력횟수점수": round(metrics["input"], 1),
@@ -1484,7 +1617,7 @@ class MainWindow(QMainWindow):
                 "트리플점수": round(metrics["triple"], 1),
                 "최근패턴점수": round(metrics["recent"], 1),
                 "자체추천점수": round(metrics.get("self", 0.0), 1),
-                "같이잘나온수": ", ".join(
+                "동반출현횟수": ", ".join(
                     f"{a}-{b}({count}회)"
                     for (a, b), count in recommender.pair_details(combo, 3)
                 ),
