@@ -1,4 +1,4 @@
-# 太炅 Lotto Lab Ultimate v6.0
+# 太炅 Lotto Lab Ultimate v5.1
 
 Windows와 Android를 한 저장소에서 관리하는 통합 프로젝트입니다.
 

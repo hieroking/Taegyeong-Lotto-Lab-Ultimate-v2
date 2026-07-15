@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "5.0.0"
+VERSION = "5.4.0"
 
 
 
@@ -500,6 +500,130 @@ class Recommender:
         final = sorted(selected, key=lambda n: (-scores[n], n))[:limit]
         return sorted(final)
 
+    @staticmethod
+    def filter_mode(input_count: int) -> tuple[str, str]:
+        """입력 번호 개수에 따라 자동 필터 강도를 결정합니다."""
+        if input_count <= 14:
+            return "기본", "10~14개 입력: 결과 확보를 우선하는 완화 필터"
+        if input_count <= 24:
+            return "고급", "15~24개 입력: 균형과 통계를 함께 보는 고급 필터"
+        return "정밀", "25개 이상 입력: 후보가 많아 더 엄격한 정밀 필터"
+
+    def passes_filter(
+        self,
+        combo: tuple[int, ...],
+        mode: str,
+        sum_min: int,
+        sum_max: int,
+        allow_consecutive: bool,
+    ) -> bool:
+        total = sum(combo)
+        if not sum_min <= total <= sum_max:
+            return False
+
+        odd = sum(n % 2 for n in combo)
+        high = sum(n >= 23 for n in combo)
+        consecutive = self.consecutive_pairs(combo)
+
+        if not allow_consecutive and consecutive > 0:
+            return False
+
+        if mode == "기본":
+            if odd not in (1, 2, 3, 4, 5):
+                return False
+            if high not in (0, 1, 2, 3, 4, 5, 6):
+                return False
+            if consecutive > 4:
+                return False
+            return True
+
+        if mode == "고급":
+            if odd not in (2, 3, 4):
+                return False
+            if high not in (2, 3, 4):
+                return False
+            if consecutive > 2:
+                return False
+            return True
+
+        if odd not in (2, 3, 4):
+            return False
+        if high not in (2, 3, 4):
+            return False
+        if consecutive > 1:
+            return False
+        if total < 85 or total > 195:
+            return False
+        return True
+
+    def relaxed_fallback(
+        self,
+        pool: list[int],
+        source_weights: Counter[int],
+        category: str,
+        count: int,
+        sum_min: int,
+        sum_max: int,
+        fixed_numbers: tuple[int, ...] = (),
+        excluded_numbers: tuple[int, ...] = (),
+        candidate_numbers: tuple[int, ...] = (),
+    ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
+        """필터 결과가 부족할 때 점수순으로 자동 보충합니다."""
+        candidates = []
+        for combo in combinations(pool, 6):
+            combo_set = set(combo)
+            if fixed_numbers and not set(fixed_numbers).issubset(combo_set):
+                continue
+            if excluded_numbers and combo_set.intersection(excluded_numbers):
+                continue
+            total = sum(combo)
+            if not sum_min <= total <= sum_max:
+                continue
+            if combo in self.a.first_prize or combo in self.a.second_prize:
+                continue
+
+            metrics = dict(self.metrics(combo, source_weights))
+            candidate_hits = len(combo_set.intersection(candidate_numbers))
+            candidate_bonus = min(12.0, candidate_hits * 4.0)
+            metrics["candidate_hits"] = candidate_hits
+            metrics["candidate_bonus"] = candidate_bonus
+            score = self.category_score(metrics, category) + candidate_bonus
+            candidates.append((score, combo, metrics))
+
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        return candidates[:count]
+
+    def recommendation_reason(
+        self,
+        metrics: dict[str, float],
+        fixed_numbers: tuple[int, ...] = (),
+        candidate_numbers: tuple[int, ...] = (),
+        combo: tuple[int, ...] = (),
+    ) -> str:
+        """추천 근거를 한 줄로 요약합니다."""
+        labels = [
+            ("나온횟수 강함", metrics.get("input", 0.0)),
+            ("동반수 강함", metrics.get("pair", 0.0)),
+            ("트리플 강함", metrics.get("triple", 0.0)),
+            ("최근패턴 우수", metrics.get("recent", 0.0)),
+            ("조합 균형 우수", metrics.get("structure", 0.0)),
+        ]
+        labels.sort(key=lambda item: (-item[1], item[0]))
+        selected = [name for name, score in labels[:2] if score >= 35]
+        if not selected:
+            selected = [labels[0][0]]
+
+        if fixed_numbers:
+            selected.append("필수번호 " + ",".join(map(str, fixed_numbers)))
+
+        included_candidates = sorted(set(combo) & set(candidate_numbers))
+        if included_candidates:
+            selected.append(
+                "후보번호 포함 " + ",".join(map(str, included_candidates))
+            )
+
+        return " / ".join(selected)
+
     def generate(
         self,
         source_weights: Counter[int],
@@ -508,31 +632,84 @@ class Recommender:
         sum_max: int,
         allow_consecutive: bool,
         category: str,
+        fixed_numbers: tuple[int, ...] = (),
+        excluded_numbers: tuple[int, ...] = (),
+        candidate_numbers: tuple[int, ...] = (),
     ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
-        pool = self.select_pool(source_weights, category, limit=24)
+        input_count = len(source_weights)
+        mode, _ = self.filter_mode(input_count)
+
+        fixed_numbers = tuple(sorted(set(fixed_numbers)))
+        excluded_numbers = tuple(sorted(set(excluded_numbers)))
+        candidate_numbers = tuple(sorted(set(candidate_numbers)))
+
+        fixed_set = set(fixed_numbers)
+        excluded_set = set(excluded_numbers)
+        candidate_set = set(candidate_numbers)
+
+        if fixed_set & excluded_set:
+            raise ValueError("필수번호와 제외번호가 중복됩니다.")
+        if fixed_set & candidate_set:
+            raise ValueError("필수번호와 후보번호가 중복됩니다.")
+        if excluded_set & candidate_set:
+            raise ValueError("제외번호와 후보번호가 중복됩니다.")
+
+        missing_fixed = [n for n in fixed_numbers if n not in source_weights]
+        if missing_fixed:
+            raise ValueError(
+                "필수번호는 번호 입력란에도 포함되어야 합니다: "
+                + ", ".join(map(str, missing_fixed))
+            )
+
+        pool_limit = 24 if input_count >= 25 else input_count
+        pool = self.select_pool(source_weights, category, limit=pool_limit)
+        pool = sorted((set(pool) | fixed_set | candidate_set) - excluded_set)
+
         if len(pool) < 6:
             raise ValueError("고유 번호가 최소 6개 필요합니다.")
 
         candidates = []
         for combo in combinations(pool, 6):
-            total = sum(combo)
-            if not sum_min <= total <= sum_max:
+            combo_set = set(combo)
+            if fixed_numbers and not set(fixed_numbers).issubset(combo_set):
                 continue
-
-            odd = sum(n % 2 for n in combo)
-            high = sum(n >= 23 for n in combo)
-            if odd not in (2, 3, 4) or high not in (2, 3, 4):
+            if excluded_numbers and combo_set.intersection(excluded_numbers):
                 continue
-            if not allow_consecutive and self.consecutive_pairs(combo) > 0:
-                continue
-            if self.consecutive_pairs(combo) > 2:
+            if not self.passes_filter(
+                combo, mode, sum_min, sum_max, allow_consecutive
+            ):
                 continue
             if combo in self.a.first_prize or combo in self.a.second_prize:
                 continue
 
-            metrics = self.metrics(combo, source_weights)
-            score = self.category_score(metrics, category)
+            metrics = dict(self.metrics(combo, source_weights))
+            metrics["filter_mode"] = mode
+            candidate_hits = len(combo_set.intersection(candidate_numbers))
+            candidate_bonus = min(12.0, candidate_hits * 4.0)
+            metrics["candidate_hits"] = candidate_hits
+            metrics["candidate_bonus"] = candidate_bonus
+            score = self.category_score(metrics, category) + candidate_bonus
             candidates.append((score, combo, metrics))
+
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+
+        if len(candidates) < count:
+            existing = {combo for _, combo, _ in candidates}
+            fallback = self.relaxed_fallback(
+                pool, source_weights, category, count, sum_min, sum_max,
+                fixed_numbers=fixed_numbers,
+                excluded_numbers=excluded_numbers,
+                candidate_numbers=candidate_numbers,
+            )
+            for score, combo, metrics in fallback:
+                if combo in existing:
+                    continue
+                metrics = dict(metrics)
+                metrics["filter_mode"] = f"{mode}→자동완화"
+                candidates.append((score, combo, metrics))
+                existing.add(combo)
+                if len(candidates) >= count:
+                    break
 
         candidates.sort(key=lambda x: (-x[0], x[1]))
         return candidates[:count]
@@ -688,6 +865,37 @@ class MainWindow(QMainWindow):
             "2 6 8 9 15 18 22 28 30 34 35 37"
         )
         rl.addWidget(self.source_input)
+
+        fixed_label = QLabel(
+            "필수번호 — 자체추천을 제외한 모든 추천 조합에 반드시 포함됩니다."
+        )
+        fixed_label.setWordWrap(True)
+        rl.addWidget(fixed_label)
+
+        self.fixed_input = QLineEdit()
+        self.fixed_input.setPlaceholderText("예: 3 6 또는 3, 6, 24")
+        rl.addWidget(self.fixed_input)
+
+        excluded_label = QLabel(
+            "제외번호 — 자체추천을 제외한 모든 추천 조합에서 제거됩니다."
+        )
+        excluded_label.setWordWrap(True)
+        rl.addWidget(excluded_label)
+
+        self.excluded_input = QLineEdit()
+        self.excluded_input.setPlaceholderText("예: 18 29")
+        rl.addWidget(self.excluded_input)
+
+        candidate_label = QLabel(
+            "후보번호 — 포함 시 가산점을 받지만 필수는 아닙니다."
+        )
+        candidate_label.setWordWrap(True)
+        rl.addWidget(candidate_label)
+
+        self.candidate_input = QLineEdit()
+        self.candidate_input.setPlaceholderText("예: 7 14 33")
+        rl.addWidget(self.candidate_input)
+
         analyze = QPushButton("입력 번호 집계")
         analyze.setObjectName("primary")
         analyze.clicked.connect(self.update_source_counts)
@@ -968,7 +1176,66 @@ class MainWindow(QMainWindow):
             self.photo_list.takeItem(row)
             self.photo_paths.pop(row)
 
+    @staticmethod
+    def _parse_special_numbers(text: str, label: str, maximum: int = 10) -> tuple[int, ...]:
+        numbers = sorted({
+            int(x)
+            for x in re.findall(r"\d{1,2}", text)
+            if 1 <= int(x) <= 45
+        })
+        if len(numbers) > maximum:
+            raise ValueError(f"{label}는 최대 {maximum}개까지 입력할 수 있습니다.")
+        return tuple(numbers)
+
+    def fixed_numbers(self) -> tuple[int, ...]:
+        text = self.fixed_input.text() if hasattr(self, "fixed_input") else ""
+        return self._parse_special_numbers(text, "필수번호", 5)
+
+    def excluded_numbers(self) -> tuple[int, ...]:
+        text = self.excluded_input.text() if hasattr(self, "excluded_input") else ""
+        return self._parse_special_numbers(text, "제외번호", 10)
+
+    def candidate_numbers(self) -> tuple[int, ...]:
+        text = self.candidate_input.text() if hasattr(self, "candidate_input") else ""
+        return self._parse_special_numbers(text, "후보번호", 10)
+
+    def validate_special_numbers(
+        self,
+        source_weights: Counter[int],
+        fixed_numbers: tuple[int, ...],
+        excluded_numbers: tuple[int, ...],
+        candidate_numbers: tuple[int, ...],
+    ) -> None:
+        fixed_set = set(fixed_numbers)
+        excluded_set = set(excluded_numbers)
+        candidate_set = set(candidate_numbers)
+
+        if fixed_set & excluded_set:
+            raise ValueError(
+                "필수번호와 제외번호에 같은 번호가 있습니다: "
+                + ", ".join(map(str, sorted(fixed_set & excluded_set)))
+            )
+        if fixed_set & candidate_set:
+            raise ValueError(
+                "필수번호와 후보번호에 같은 번호가 있습니다: "
+                + ", ".join(map(str, sorted(fixed_set & candidate_set)))
+            )
+        if excluded_set & candidate_set:
+            raise ValueError(
+                "제외번호와 후보번호에 같은 번호가 있습니다: "
+                + ", ".join(map(str, sorted(excluded_set & candidate_set)))
+            )
+
+        missing_fixed = [n for n in fixed_numbers if n not in source_weights]
+        if missing_fixed:
+            raise ValueError(
+                "필수번호는 일반 번호 입력란에도 포함되어야 합니다: "
+                + ", ".join(map(str, missing_fixed))
+            )
+
     def source_weights(self) -> Counter[int]:
+        # 필수·제외·후보번호 입력란은 여기 합산하지 않습니다.
+        # 따라서 일반 입력번호의 나온횟수가 중복 증가하지 않습니다.
         nums = parse_numbers(self.source_input.toPlainText())
         return Counter(nums)
 
@@ -979,9 +1246,18 @@ class MainWindow(QMainWindow):
                 self.source_summary.setText("입력된 번호가 없습니다.")
                 return
             ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+            fixed = self.fixed_numbers()
+            excluded = self.excluded_numbers()
+            candidate = self.candidate_numbers()
+
+            fixed_text = "없음" if not fixed else ", ".join(map(str, fixed))
+            excluded_text = "없음" if not excluded else ", ".join(map(str, excluded))
+            candidate_text = "없음" if not candidate else ", ".join(map(str, candidate))
+
             self.source_summary.setText(
-                f"고유 번호 {len(counts)}개 / 전체 입력 {sum(counts.values())}개\n" +
-                " · ".join(f"{n}번 {c}회" for n, c in ranked)
+                f"고유 번호 {len(counts)}개 / 전체 입력 {sum(counts.values())}개\n"
+                f"필수번호: {fixed_text} / 제외번호: {excluded_text} / 후보번호: {candidate_text}\n"
+                + " · ".join(f"{n}번 {c}회" for n, c in ranked)
             )
             if self.analyzer.draws and len(counts) >= 6:
                 self.excel_status.setText(
@@ -1036,8 +1312,20 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("역대 전체 데이터로 자체추천 100조합 계산 중...")
                 QApplication.processEvents()
                 self.recommendations = recommender.generate_self(100)
+                fixed_numbers = ()
+                excluded_numbers = ()
+                candidate_numbers = ()
             else:
                 weights = self.source_weights()
+                fixed_numbers = self.fixed_numbers()
+                excluded_numbers = self.excluded_numbers()
+                candidate_numbers = self.candidate_numbers()
+                self.validate_special_numbers(
+                    weights,
+                    fixed_numbers,
+                    excluded_numbers,
+                    candidate_numbers,
+                )
                 if len(weights) < 6:
                     self.rec_table.setRowCount(0)
                     self.rec_status.setText(
@@ -1047,8 +1335,13 @@ class MainWindow(QMainWindow):
                         f"{category}: 사진 또는 직접 입력으로 고유 번호 6개 이상을 입력하세요."
                     )
                     return
-                self.rec_status.setText(f"{category} 100조합을 계산 중입니다...")
-                self.statusBar().showMessage(f"{category} 100조합 계산 중...")
+                filter_name, filter_desc = recommender.filter_mode(len(weights))
+                self.rec_status.setText(
+                    f"{category} 100조합 계산 중 · {filter_desc}"
+                )
+                self.statusBar().showMessage(
+                    f"{category} 계산 중 · {filter_name} 필터"
+                )
                 QApplication.processEvents()
                 self.recommendations = recommender.generate(
                     weights,
@@ -1057,11 +1350,14 @@ class MainWindow(QMainWindow):
                     300,
                     True,
                     category,
+                    fixed_numbers=fixed_numbers,
+                    excluded_numbers=excluded_numbers,
+                    candidate_numbers=candidate_numbers,
                 )
             if not self.recommendations:
                 QMessageBox.information(
                     self, "결과 없음",
-                    "조건을 만족하는 조합이 없습니다. 합계 범위나 입력 번호를 조정하세요."
+                    "추천 가능한 조합이 없습니다. 입력번호를 10개 이상으로 확인해 주세요."
                 )
                 return
 
@@ -1074,9 +1370,16 @@ class MainWindow(QMainWindow):
                     f"{a}↔{b} {count}회"
                     for (a, b), count in recommender.pair_details(combo, 3)
                 )
+                reason = recommender.recommendation_reason(
+                    metrics,
+                    fixed_numbers,
+                    candidate_numbers,
+                    combo,
+                )
                 values = [
                     str(r),
                     " · ".join(map(str, combo)),
+                    reason,
                     f"{score:.1f}",
                     f"{metrics['composite']:.1f}",
                     f"{metrics['input']:.1f}",
@@ -1091,8 +1394,8 @@ class MainWindow(QMainWindow):
 
                 # 현재 선택한 카테고리의 점수 칸을 강조
                 metric_column = {
-                    "composite": 3, "input": 4, "pair": 5,
-                    "triple": 6, "recent": 7, "self": 2,
+                    "composite": 4, "input": 5, "pair": 6,
+                    "triple": 7, "recent": 8, "self": 3,
                 }[selected_key]
                 metric_value = metrics.get(selected_key, score)
                 item = self.rec_table.item(r - 1, metric_column)
@@ -1112,11 +1415,21 @@ class MainWindow(QMainWindow):
                     combo_item.setForeground(QBrush(QColor("#FFD95A")))
 
             self.rec_table.resizeColumnsToContents()
+            if category == "자체추천":
+                filter_text = "역대 전체 데이터 자동분석"
+            else:
+                mode_values = {
+                    str(row_metrics.get("filter_mode", "자동"))
+                    for _, _, row_metrics in self.recommendations
+                }
+                filter_text = ", ".join(sorted(mode_values))
+
             self.rec_status.setText(
-                f"{category} 기준 {len(self.recommendations)}조합 계산 완료"
+                f"{category} 기준 {len(self.recommendations)}조합 계산 완료 · "
+                f"적용 필터: {filter_text}"
             )
             self.statusBar().showMessage(
-                f"{category} 기준 추천 {len(self.recommendations)}개 생성 완료"
+                f"{category} 추천 {len(self.recommendations)}개 완료"
             )
         except Exception as e:
             QMessageBox.warning(self, "추천 오류", str(e))
@@ -1139,6 +1452,15 @@ class MainWindow(QMainWindow):
             path += ".xlsx"
 
         recommender = Recommender(self.analyzer)
+        if category == "자체추천":
+            fixed_numbers = ()
+            excluded_numbers = ()
+            candidate_numbers = ()
+        else:
+            fixed_numbers = self.fixed_numbers()
+            excluded_numbers = self.excluded_numbers()
+            candidate_numbers = self.candidate_numbers()
+
         rows = []
         for rank, (score, combo, metrics) in enumerate(self.recommendations, 1):
             rows.append({
@@ -1146,6 +1468,15 @@ class MainWindow(QMainWindow):
                 "순위": rank,
                 "번호1": combo[0], "번호2": combo[1], "번호3": combo[2],
                 "번호4": combo[3], "번호5": combo[4], "번호6": combo[5],
+                "필수번호": ", ".join(map(str, fixed_numbers)),
+                "제외번호": ", ".join(map(str, excluded_numbers)),
+                "후보번호": ", ".join(map(str, candidate_numbers)),
+                "추천이유": recommender.recommendation_reason(
+                    metrics,
+                    fixed_numbers,
+                    candidate_numbers,
+                    combo,
+                ),
                 "카테고리점수": round(score, 1),
                 "종합점수": round(metrics["composite"], 1),
                 "입력횟수점수": round(metrics["input"], 1),
