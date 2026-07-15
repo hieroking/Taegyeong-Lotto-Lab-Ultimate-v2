@@ -9,10 +9,10 @@ android {
 
     defaultConfig {
         applicationId = "com.taegyeong.lottolab"
-        minSdk = 23
+        minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "5.0.0"
+        versionCode = 6
+        versionName = "6.0.0"
     }
 
     buildFeatures {
@@ -22,8 +22,6 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
-
-
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
