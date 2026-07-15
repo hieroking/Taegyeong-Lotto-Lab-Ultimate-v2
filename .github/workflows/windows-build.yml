@@ -1,0 +1,56 @@
+name: Windows EXE 자동 빌드
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Windows/**"
+      - ".github/workflows/windows-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: 저장소 받기
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "Windows/requirements.txt"
+
+      - name: 라이브러리 설치
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r Windows/requirements.txt
+
+      - name: EXE 생성
+        shell: pwsh
+        working-directory: Windows
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --windowed `
+            --onefile `
+            --name "TaegyeongLottoLab" `
+            --collect-all PySide6 `
+            --collect-all pandas `
+            --hidden-import openpyxl `
+            app.py
+
+      - name: EXE 다운로드 등록
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaegyeongLottoLab-Windows-v5.1
+          path: Windows/dist/TaegyeongLottoLab.exe
+          if-no-files-found: error
+          retention-days: 30
