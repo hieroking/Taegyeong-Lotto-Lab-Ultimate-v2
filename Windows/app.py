@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "5.7.0"
+VERSION = "6.0.0"
 
 
 
@@ -244,6 +244,7 @@ class Recommender:
         "트리플": "triple",
         "최근패턴": "recent",
         "통합데이터추천": "mixed",
+        "특이패턴추천": "pattern",
         "자체추천": "self",
     }
 
@@ -659,6 +660,402 @@ class Recommender:
                 "strategy": f"통합-{applied_preset}",
             })
             candidates.append((mixed_score, combo, base_metrics))
+
+        candidates.sort(key=lambda row: (-row[0], row[1]))
+        return self.select_diverse(candidates, count)
+
+    PATTERN_NAMES = (
+        "이월수", "2회전재등장", "단기강세", "장기미출현복귀",
+        "끝수흐름", "연속수후보", "동반수확장", "간격수흐름",
+    )
+
+    @staticmethod
+    def _normalize_counter(
+        values: Counter[int] | dict[int, float],
+    ) -> dict[int, float]:
+        maximum = max(values.values(), default=0)
+        if maximum <= 0:
+            return {n: 0.0 for n in range(1, 46)}
+        return {
+            n: float(values.get(n, 0)) / maximum * 100.0
+            for n in range(1, 46)
+        }
+
+    @staticmethod
+    def _number_gaps(draws: list[Draw]) -> dict[int, int]:
+        latest_index = len(draws) - 1
+        last_seen = {}
+        for index, draw in enumerate(draws):
+            for number in draw.numbers:
+                last_seen[number] = index
+        return {
+            number: latest_index - last_seen.get(number, -1)
+            for number in range(1, 46)
+        }
+
+    @classmethod
+    def _pattern_number_scores(
+        cls,
+        draws: list[Draw],
+    ) -> tuple[dict[str, dict[int, float]], dict[int, list[str]]]:
+        """각 패턴별 1~45 번호 점수와 번호별 추천 근거를 계산합니다."""
+        if len(draws) < 10:
+            raise ValueError("특이패턴 분석에는 최소 10회 이상의 데이터가 필요합니다.")
+
+        last = draws[-1].numbers
+        previous = draws[-2].numbers
+        recent10 = draws[-10:]
+        recent30 = draws[-30:]
+        recent100 = draws[-100:]
+
+        pattern_scores: dict[str, dict[int, float]] = {
+            name: {n: 0.0 for n in range(1, 46)}
+            for name in cls.PATTERN_NAMES
+        }
+        reasons: dict[int, list[str]] = defaultdict(list)
+
+        # 1. 이월수: 역대 이월수 평균과 직전 회차 번호
+        rollover_counts = Counter()
+        for before, after in zip(draws[:-1], draws[1:]):
+            rollover_counts[len(set(before.numbers) & set(after.numbers))] += 1
+        total_transitions = max(1, sum(rollover_counts.values()))
+        rollover_probability = 1.0 - rollover_counts[0] / total_transitions
+        rollover_base = 72.0 + rollover_probability * 25.0
+        for number in last:
+            pattern_scores["이월수"][number] = rollover_base
+            reasons[number].append("직전회차 이월수 후보")
+
+        # 2. 2회 전 재등장: 2회 전에는 있었지만 직전에는 없던 번호
+        for number in set(previous) - set(last):
+            pattern_scores["2회전재등장"][number] = 82.0
+            reasons[number].append("2회 전 번호 재등장 후보")
+
+        # 3. 단기강세: 최근 10회와 30회 빈도를 혼합
+        count10 = Counter(n for draw in recent10 for n in draw.numbers)
+        count30 = Counter(n for draw in recent30 for n in draw.numbers)
+        norm10 = cls._normalize_counter(count10)
+        norm30 = cls._normalize_counter(count30)
+        for number in range(1, 46):
+            score = norm10[number] * 0.65 + norm30[number] * 0.35
+            pattern_scores["단기강세"][number] = score
+            if score >= 72:
+                reasons[number].append("최근 10·30회 강세")
+
+        # 4. 장기 미출현 복귀
+        gaps = cls._number_gaps(draws)
+        sorted_gaps = sorted(gaps.values())
+        q70 = sorted_gaps[int(len(sorted_gaps) * 0.70)]
+        max_gap = max(sorted_gaps, default=1)
+        for number, gap in gaps.items():
+            score = min(100.0, gap / max(1, max_gap) * 100.0)
+            pattern_scores["장기미출현복귀"][number] = score
+            if gap >= q70:
+                reasons[number].append(f"{gap}회 미출현 복귀 후보")
+
+        # 5. 끝수 흐름
+        ending10 = Counter(n % 10 for draw in recent10 for n in draw.numbers)
+        ending30 = Counter(n % 10 for draw in recent30 for n in draw.numbers)
+        max_ending = max(
+            (ending10[e] * 0.7 + ending30[e] * 0.3 for e in range(10)),
+            default=1,
+        )
+        for number in range(1, 46):
+            ending = number % 10
+            raw = ending10[ending] * 0.7 + ending30[ending] * 0.3
+            score = raw / max(1, max_ending) * 100.0
+            pattern_scores["끝수흐름"][number] = score
+            if score >= 78:
+                reasons[number].append(f"끝수 {ending} 흐름 강세")
+
+        # 6. 연속수 후보: 직전 번호의 앞뒤 번호
+        for number in last:
+            for candidate in (number - 1, number + 1):
+                if 1 <= candidate <= 45 and candidate not in last:
+                    pattern_scores["연속수후보"][candidate] = max(
+                        pattern_scores["연속수후보"][candidate],
+                        88.0,
+                    )
+                    reasons[candidate].append(f"{number}번 인접 연속수 후보")
+
+        # 7. 동반수 확장: 직전 번호들과 최근100회에 자주 함께 나온 번호
+        recent_pairs = Counter(
+            pair for draw in recent100 for pair in combinations(draw.numbers, 2)
+        )
+        partner_raw = Counter()
+        for number in last:
+            for candidate in range(1, 46):
+                if candidate == number or candidate in last:
+                    continue
+                pair = tuple(sorted((number, candidate)))
+                partner_raw[candidate] += recent_pairs[pair]
+        partner_norm = cls._normalize_counter(partner_raw)
+        for number, score in partner_norm.items():
+            pattern_scores["동반수확장"][number] = score
+            if score >= 72:
+                reasons[number].append("직전번호 동반수 확장")
+
+        # 8. 간격수 흐름: 최근 당첨 조합에서 자주 나온 번호 간 차이를 직전번호에 적용
+        gap_counts = Counter()
+        for draw in recent30:
+            nums = draw.numbers
+            for a, b in combinations(nums, 2):
+                gap = b - a
+                if 1 <= gap <= 15:
+                    gap_counts[gap] += 1
+        common_gaps = [gap for gap, _ in gap_counts.most_common(5)]
+        for source in last:
+            for rank, gap in enumerate(common_gaps):
+                score = 92.0 - rank * 8.0
+                for candidate in (source - gap, source + gap):
+                    if 1 <= candidate <= 45 and candidate not in last:
+                        pattern_scores["간격수흐름"][candidate] = max(
+                            pattern_scores["간격수흐름"][candidate],
+                            score,
+                        )
+                        if score >= 76:
+                            reasons[candidate].append(f"간격 {gap} 흐름 후보")
+
+        return pattern_scores, reasons
+
+    @classmethod
+    def pattern_reliability(
+        cls,
+        draws: list[Draw],
+        test_rounds: int = 60,
+    ) -> dict[str, float]:
+        """최근 과거 회차에서 패턴별 TOP10의 평균 적중도를 계산합니다."""
+        reliability = {name: 50.0 for name in cls.PATTERN_NAMES}
+        if len(draws) < 80:
+            return reliability
+
+        hit_totals = Counter()
+        tested = 0
+        start = max(20, len(draws) - test_rounds)
+        for target_index in range(start, len(draws)):
+            history = draws[:target_index]
+            target = set(draws[target_index].numbers)
+            scores, _ = cls._pattern_number_scores(history)
+            for name, number_scores in scores.items():
+                top10 = {
+                    n for n, _ in sorted(
+                        number_scores.items(),
+                        key=lambda item: (-item[1], item[0]),
+                    )[:10]
+                }
+                hit_totals[name] += len(top10 & target)
+            tested += 1
+
+        if tested:
+            for name in cls.PATTERN_NAMES:
+                average_hits = hit_totals[name] / tested
+                # TOP10 무작위 기대 적중은 약 1.33개. 이를 기준으로 35~100점 환산.
+                reliability[name] = round(
+                    max(35.0, min(100.0, 50.0 + (average_hits - 1.33) * 28.0)),
+                    1,
+                )
+        return reliability
+
+    def pattern_board(
+        self,
+    ) -> tuple[list[dict[str, object]], dict[str, float]]:
+        scores, reasons = self._pattern_number_scores(self.a.draws)
+        reliability = self.pattern_reliability(self.a.draws)
+
+        rows = []
+        for number in range(1, 46):
+            votes = []
+            weighted_score = 0.0
+            weight_sum = 0.0
+            for name in self.PATTERN_NAMES:
+                score = scores[name][number]
+                rel = reliability[name]
+                weighted_score += score * rel
+                weight_sum += rel
+                if score >= 68:
+                    votes.append(name)
+
+            final_score = weighted_score / max(1.0, weight_sum)
+            rows.append({
+                "number": number,
+                "score": round(final_score, 1),
+                "votes": len(votes),
+                "patterns": votes,
+                "reasons": reasons.get(number, []),
+            })
+
+        rows.sort(
+            key=lambda row: (
+                -int(row["votes"]),
+                -float(row["score"]),
+                int(row["number"]),
+            )
+        )
+        return rows, reliability
+
+    def pattern_briefing(self) -> str:
+        board, reliability = self.pattern_board()
+        top = board[:12]
+        exclusions = sorted(
+            board,
+            key=lambda row: (
+                int(row["votes"]),
+                float(row["score"]),
+                int(row["number"]),
+            ),
+        )[:8]
+
+        latest = self.a.draws[-1]
+        recent10 = self.a.draws[-10:]
+        average_sum = sum(sum(d.numbers) for d in recent10) / len(recent10)
+        average_odd = sum(
+            sum(n % 2 for n in d.numbers) for d in recent10
+        ) / len(recent10)
+        strongest = sorted(
+            reliability.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:3]
+
+        top_text = " · ".join(
+            f"{row['number']}({row['votes']}표)"
+            for row in top
+        )
+        excluded_text = " · ".join(str(row["number"]) for row in exclusions)
+        pattern_text = " / ".join(
+            f"{name} {score:.1f}점" for name, score in strongest
+        )
+        return (
+            f"이번 주 특이패턴 브리핑\n"
+            f"최신 기준 회차: {latest.round_no}회\n"
+            f"최근 10회 평균 합계: {average_sum:.1f} / 평균 홀수: {average_odd:.1f}개\n"
+            f"검증점수 상위 패턴: {pattern_text}\n\n"
+            f"패턴투표 핵심번호 TOP12\n{top_text}\n\n"
+            f"AI 제외 검토번호 8개\n{excluded_text}\n\n"
+            f"※ 패턴투표는 과거 통계를 이용한 분석이며 당첨을 보장하지 않습니다."
+        )
+
+    def historical_similar_draws(
+        self,
+        combo: tuple[int, ...],
+        top_n: int = 5,
+    ) -> list[tuple[int, float, tuple[int, ...]]]:
+        """합계·홀짝·구간·끝수·연속수 특성이 비슷한 과거 회차를 찾습니다."""
+        def signature(numbers: tuple[int, ...]) -> tuple:
+            total = sum(numbers)
+            odd = sum(n % 2 for n in numbers)
+            low = sum(n <= 22 for n in numbers)
+            endings = len({n % 10 for n in numbers})
+            consecutive = self.consecutive_pairs(numbers)
+            zones = (
+                sum(1 <= n <= 10 for n in numbers),
+                sum(11 <= n <= 20 for n in numbers),
+                sum(21 <= n <= 30 for n in numbers),
+                sum(31 <= n <= 40 for n in numbers),
+                sum(41 <= n <= 45 for n in numbers),
+            )
+            return total, odd, low, endings, consecutive, zones
+
+        target = signature(combo)
+        rows = []
+        for draw in self.a.draws:
+            sig = signature(draw.numbers)
+            distance = (
+                abs(target[0] - sig[0]) / 25.0
+                + abs(target[1] - sig[1]) * 0.8
+                + abs(target[2] - sig[2]) * 0.6
+                + abs(target[3] - sig[3]) * 0.4
+                + abs(target[4] - sig[4]) * 0.8
+                + sum(abs(a - b) for a, b in zip(target[5], sig[5])) * 0.35
+            )
+            similarity = max(0.0, 100.0 - distance * 12.0)
+            rows.append((draw.round_no, round(similarity, 1), draw.numbers))
+        rows.sort(key=lambda row: (-row[1], -row[0]))
+        return rows[:top_n]
+
+    def generate_pattern(
+        self,
+        count: int,
+        mode: str = "자동종합",
+        fixed_numbers: tuple[int, ...] = (),
+        excluded_numbers: tuple[int, ...] = (),
+        candidate_numbers: tuple[int, ...] = (),
+    ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
+        board, reliability = self.pattern_board()
+        board_map = {int(row["number"]): row for row in board}
+        fixed_set = set(fixed_numbers)
+        excluded_set = set(excluded_numbers)
+        candidate_set = set(candidate_numbers)
+
+        if mode != "자동종합" and mode in self.PATTERN_NAMES:
+            pattern_scores, reasons = self._pattern_number_scores(self.a.draws)
+            ranked_numbers = sorted(
+                range(1, 46),
+                key=lambda n: (-pattern_scores[mode][n], n),
+            )
+        else:
+            ranked_numbers = [int(row["number"]) for row in board]
+            _, reasons = self._pattern_number_scores(self.a.draws)
+
+        selected = []
+        for number in list(fixed_set | candidate_set) + ranked_numbers:
+            if number in excluded_set or number in selected:
+                continue
+            selected.append(number)
+            if len(selected) >= 20:
+                break
+        pool = sorted(selected)
+
+        candidates = []
+        for combo in combinations(pool, 6):
+            combo_set = set(combo)
+            if fixed_set and not fixed_set.issubset(combo_set):
+                continue
+            if excluded_set & combo_set:
+                continue
+            if combo in self.a.first_prize or combo in self.a.second_prize:
+                continue
+
+            odd = sum(n % 2 for n in combo)
+            high = sum(n >= 23 for n in combo)
+            total = sum(combo)
+            if odd not in (2, 3, 4) or high not in (2, 3, 4):
+                continue
+            if not 85 <= total <= 200:
+                continue
+
+            values = [float(board_map[n]["score"]) for n in combo]
+            votes = [int(board_map[n]["votes"]) for n in combo]
+            pattern_score = sum(values) / 6.0 + sum(votes) * 1.7
+
+            pair_values = [
+                self.a.recent_pair_counts[pair]
+                for pair in combinations(combo, 2)
+            ]
+            pair_bonus = min(12.0, sum(sorted(pair_values, reverse=True)[:4]) / 8.0)
+            candidate_bonus = min(12.0, len(combo_set & candidate_set) * 4.0)
+            final_score = pattern_score + pair_bonus + candidate_bonus
+
+            metrics = dict(self.metrics(combo, Counter({n: 1 for n in pool})))
+            combo_patterns = Counter()
+            combo_reasons = []
+            for number in combo:
+                for pattern in board_map[number]["patterns"]:
+                    combo_patterns[pattern] += 1
+                combo_reasons.extend(reasons.get(number, []))
+
+            leading_patterns = [
+                name for name, _ in combo_patterns.most_common(3)
+            ]
+            metrics.update({
+                "pattern": final_score,
+                "pattern_score": pattern_score,
+                "pattern_votes": sum(votes),
+                "pattern_mode": mode,
+                "pattern_names": leading_patterns,
+                "pattern_reasons": list(dict.fromkeys(combo_reasons))[:5],
+                "pattern_reliability": reliability,
+                "strategy": f"특이패턴-{mode}",
+            })
+            candidates.append((final_score, combo, metrics))
 
         candidates.sort(key=lambda row: (-row[0], row[1]))
         return self.select_diverse(candidates, count)
@@ -1116,7 +1513,7 @@ class MainWindow(QMainWindow):
 
         names = [
             "번호 입력", "추천조합", "나온횟수", "동반수", "트리플",
-            "최근패턴", "통합데이터추천", "자체추천"
+            "최근패턴", "통합데이터추천", "특이패턴추천", "자체추천"
         ]
         for i, name in enumerate(names):
             b = QPushButton(name)
@@ -1291,7 +1688,9 @@ class MainWindow(QMainWindow):
 
         guide = QLabel(
             "사진 또는 직접 입력한 번호를 기준으로 자동 계산합니다.\n"
-            "추천 100조합 · 번호합계 20~300 · 역대 1등·2등 동일 조합 제외\n자체추천은 사진이나 직접입력 없이 역대 전체 당첨번호만으로 계산합니다."
+            "추천 100조합 · 역대 1등·2등 동일 조합 제외\n"
+            "특이패턴추천은 이월수·재등장·강세·미출현·끝수·연속수·동반수·간격수의 번호를 투표식으로 종합합니다.\n"
+            "자체추천은 사진이나 직접입력 없이 역대 전체 당첨번호만으로 계산합니다."
         )
         guide.setObjectName("card")
         guide.setWordWrap(True)
@@ -1301,7 +1700,7 @@ class MainWindow(QMainWindow):
         self.rec_category.addItems(
             [
                 "추천조합", "나온횟수", "동반수", "트리플",
-                "최근패턴", "통합데이터추천", "자체추천"
+                "최근패턴", "통합데이터추천", "특이패턴추천", "자체추천"
             ]
         )
         self.rec_category.currentTextChanged.connect(self.generate_recommendations)
@@ -1339,6 +1738,34 @@ class MainWindow(QMainWindow):
         mixed_help.setWordWrap(True)
         mixed_row.addWidget(mixed_help, 1)
         lay.addLayout(mixed_row)
+
+        pattern_row = QHBoxLayout()
+        pattern_label = QLabel("특이패턴")
+        self.pattern_mode_combo = QComboBox()
+        self.pattern_mode_combo.addItems(
+            [
+                "자동종합", "이월수", "2회전재등장", "단기강세",
+                "장기미출현복귀", "끝수흐름", "연속수후보",
+                "동반수확장", "간격수흐름",
+            ]
+        )
+        self.pattern_mode_combo.currentTextChanged.connect(
+            self.generate_recommendations
+        )
+        pattern_row.addWidget(pattern_label)
+        pattern_row.addWidget(self.pattern_mode_combo)
+
+        self.pattern_brief_btn = QPushButton("이번 주 패턴 브리핑")
+        self.pattern_brief_btn.clicked.connect(self.show_pattern_briefing)
+        pattern_row.addWidget(self.pattern_brief_btn)
+
+        self.round_search_input = QLineEdit()
+        self.round_search_input.setPlaceholderText("회차/번호 검색: 33 37 40")
+        pattern_row.addWidget(self.round_search_input, 1)
+        self.round_search_btn = QPushButton("회차 검색")
+        self.round_search_btn.clicked.connect(self.search_rounds)
+        pattern_row.addWidget(self.round_search_btn)
+        lay.addLayout(pattern_row)
 
         self.rec_status = QLabel(
             "역대 Excel을 불러오면 자체추천이 자동 계산됩니다.\n"
@@ -1766,6 +2193,31 @@ class MainWindow(QMainWindow):
                 excluded_numbers = ()
                 candidate_numbers = ()
                 strategy = "자체추천"
+            elif category == "특이패턴추천":
+                fixed_numbers = self.fixed_numbers()
+                excluded_numbers = self.excluded_numbers()
+                candidate_numbers = self.candidate_numbers()
+                source_weights = self.source_weights()
+                self.validate_special_numbers(
+                    source_weights,
+                    fixed_numbers,
+                    excluded_numbers,
+                    candidate_numbers,
+                )
+                mode = self.pattern_mode_combo.currentText()
+                self.rec_status.setText(
+                    f"특이패턴추천 계산 중 · {mode} · 패턴별 추천번호를 종합합니다."
+                )
+                self.statusBar().showMessage("특이패턴 추천 100조합 계산 중...")
+                QApplication.processEvents()
+                self.recommendations = recommender.generate_pattern(
+                    100,
+                    mode=mode,
+                    fixed_numbers=fixed_numbers,
+                    excluded_numbers=excluded_numbers,
+                    candidate_numbers=candidate_numbers,
+                )
+                strategy = f"특이패턴-{mode}"
             elif category == "통합데이터추천":
                 weights = self.source_weights()
                 fixed_numbers = self.fixed_numbers()
@@ -1861,6 +2313,11 @@ class MainWindow(QMainWindow):
                     candidate_numbers,
                     combo,
                 )
+                if metrics.get("pattern_names"):
+                    reason = (
+                        "패턴투표: " + ", ".join(metrics["pattern_names"])
+                        + " / " + reason
+                    )
                 confidence = recommender.confidence_score(score, metrics)
                 grade = recommender.confidence_grade(confidence)
                 rank_text = f"TOP {r}" if r <= 10 else str(r)
@@ -1885,7 +2342,8 @@ class MainWindow(QMainWindow):
                 # 현재 선택한 카테고리의 점수 칸을 강조
                 metric_column = {
                     "composite": 6, "input": 7, "pair": 8,
-                    "triple": 9, "recent": 10, "mixed": 5, "self": 5,
+                    "triple": 9, "recent": 10, "mixed": 5,
+                    "pattern": 5, "self": 5,
                 }[selected_key]
                 metric_value = metrics.get(selected_key, score)
                 item = self.rec_table.item(r - 1, metric_column)
@@ -1930,6 +2388,62 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "추천 오류", str(e))
 
+
+    def show_pattern_briefing(self) -> None:
+        if not self.analyzer.draws:
+            QMessageBox.information(
+                self, "데이터 필요", "먼저 역대 Excel을 불러오세요."
+            )
+            return
+        try:
+            recommender = Recommender(self.analyzer)
+            briefing = recommender.pattern_briefing()
+            board, reliability = recommender.pattern_board()
+            lines = [briefing, "", "번호별 패턴투표 TOP20"]
+            for rank, row in enumerate(board[:20], 1):
+                patterns = ", ".join(row["patterns"]) or "단독 점수"
+                reasons = " / ".join(row["reasons"][:2])
+                lines.append(
+                    f"{rank:02d}. {row['number']}번 | {row['votes']}표 | "
+                    f"{row['score']:.1f}점 | {patterns}"
+                    + (f" | {reasons}" if reasons else "")
+                )
+            self.detail_box.setPlainText("\n".join(lines))
+            self.rec_status.setText(
+                "이번 주 패턴 브리핑 완료 · 상세창에서 핵심번호와 제외번호를 확인하세요."
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "패턴 분석 오류", str(exc))
+
+    def search_rounds(self) -> None:
+        if not self.analyzer.draws:
+            QMessageBox.information(
+                self, "데이터 필요", "먼저 역대 Excel을 불러오세요."
+            )
+            return
+        try:
+            values = parse_numbers(self.round_search_input.text())
+            if not values:
+                raise ValueError("검색할 번호를 입력하세요.")
+            target = set(values)
+            rows = []
+            for draw in reversed(self.analyzer.draws):
+                matched = sorted(target & set(draw.numbers))
+                if matched:
+                    rows.append(
+                        f"{draw.round_no}회 | {' · '.join(map(str, draw.numbers))} | "
+                        f"일치 {len(matched)}개: {', '.join(map(str, matched))}"
+                    )
+                if len(rows) >= 100:
+                    break
+            if not rows:
+                rows = ["일치하는 회차가 없습니다."]
+            self.detail_box.setPlainText(
+                f"번호 검색: {', '.join(map(str, values))}\n\n"
+                + "\n".join(rows)
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "회차 검색", str(exc))
 
     def run_strategy_battle(self) -> None:
         if len(self.analyzer.draws) < 120:
@@ -2094,6 +2608,12 @@ class MainWindow(QMainWindow):
             f"{a}↔{b}: {count}회"
             for (a, b), count in recommender.pair_details(combo, 5)
         ]
+        similar_lines = [
+            f"{round_no}회 · 유사도 {similarity:.1f}% · "
+            + " · ".join(map(str, numbers))
+            for round_no, similarity, numbers
+            in recommender.historical_similar_draws(combo, 5)
+        ]
         triple_lines = [
             f"{a}-{b}-{c}: {count}회"
             for (a, b, c), count in recommender.triple_details(combo, 5)
@@ -2128,6 +2648,15 @@ class MainWindow(QMainWindow):
             f"트리플 {metrics.get('triple', 0):.1f} / "
             f"최근패턴 {metrics.get('recent', 0):.1f} / "
             f"조합균형 {metrics.get('structure', 0):.1f}"
+            + (
+                f"\n\n[특이패턴]\n"
+                f"패턴투표 {metrics.get('pattern_votes', 0)}표 / "
+                f"패턴점수 {metrics.get('pattern_score', 0):.1f}\n"
+                f"주요패턴: {', '.join(metrics.get('pattern_names', []))}\n"
+                f"추천근거: {' / '.join(metrics.get('pattern_reasons', []))}"
+                if metrics.get("pattern_names") else ""
+            )
+            + "\n\n[역대 유사 회차]\n" + "\n".join(similar_lines)
         )
         self.detail_box.setPlainText(text)
 
@@ -2167,6 +2696,11 @@ class MainWindow(QMainWindow):
                 "최근100회비중": metrics.get("mixed_100_weight", ""),
                 "최근500회비중": metrics.get("mixed_500_weight", ""),
                 "최근1000회비중": metrics.get("mixed_1000_weight", ""),
+                "패턴모드": metrics.get("pattern_mode", ""),
+                "패턴투표수": metrics.get("pattern_votes", ""),
+                "패턴점수": metrics.get("pattern_score", ""),
+                "주요패턴": ", ".join(metrics.get("pattern_names", [])),
+                "패턴추천근거": " / ".join(metrics.get("pattern_reasons", [])),
                 "순위": rank,
                 "번호1": combo[0], "번호2": combo[1], "번호3": combo[2],
                 "번호4": combo[3], "번호5": combo[4], "번호6": combo[5],
