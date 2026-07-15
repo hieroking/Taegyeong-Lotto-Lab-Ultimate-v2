@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "5.5.0"
+VERSION = "5.6.0"
 
 
 
@@ -391,6 +391,43 @@ class Recommender:
             "composite": composite,
         }
 
+    STRATEGY_WEIGHTS = {
+        "균형형": {
+            "input": 0.25, "pair": 0.20, "triple": 0.15,
+            "recent": 0.15, "structure": 0.25,
+        },
+        "출현형": {
+            "input": 0.50, "pair": 0.15, "triple": 0.10,
+            "recent": 0.15, "structure": 0.10,
+        },
+        "동반수형": {
+            "input": 0.15, "pair": 0.50, "triple": 0.15,
+            "recent": 0.10, "structure": 0.10,
+        },
+        "트리플형": {
+            "input": 0.10, "pair": 0.20, "triple": 0.50,
+            "recent": 0.10, "structure": 0.10,
+        },
+        "최근형": {
+            "input": 0.15, "pair": 0.15, "triple": 0.10,
+            "recent": 0.50, "structure": 0.10,
+        },
+        "AI Ultimate": {
+            "input": 0.20, "pair": 0.20, "triple": 0.15,
+            "recent": 0.20, "structure": 0.25,
+        },
+    }
+
+    def strategy_score(
+        self,
+        metrics: dict[str, float],
+        strategy: str,
+    ) -> float:
+        weights = self.STRATEGY_WEIGHTS.get(
+            strategy, self.STRATEGY_WEIGHTS["균형형"]
+        )
+        return sum(metrics.get(key, 0.0) * weight for key, weight in weights.items())
+
     def category_score(self, metrics: dict[str, float], category: str) -> float:
         key = self.CATEGORY_NAMES.get(category, "composite")
         if key == "composite":
@@ -629,6 +666,7 @@ class Recommender:
         fixed_numbers: tuple[int, ...] = (),
         excluded_numbers: tuple[int, ...] = (),
         candidate_numbers: tuple[int, ...] = (),
+        strategy: str = "균형형",
     ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
         """필터 결과가 부족할 때 점수순으로 자동 보충합니다."""
         candidates = []
@@ -649,7 +687,13 @@ class Recommender:
             candidate_bonus = min(12.0, candidate_hits * 4.0)
             metrics["candidate_hits"] = candidate_hits
             metrics["candidate_bonus"] = candidate_bonus
-            score = self.category_score(metrics, category) + candidate_bonus
+            base_score = (
+                self.strategy_score(metrics, strategy)
+                if category == "추천조합"
+                else self.category_score(metrics, category)
+            )
+            metrics["strategy"] = strategy
+            score = base_score + candidate_bonus
             candidates.append((score, combo, metrics))
 
         candidates.sort(key=lambda x: (-x[0], x[1]))
@@ -697,6 +741,7 @@ class Recommender:
         fixed_numbers: tuple[int, ...] = (),
         excluded_numbers: tuple[int, ...] = (),
         candidate_numbers: tuple[int, ...] = (),
+        strategy: str = "균형형",
     ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
         input_count = len(source_weights)
         mode, _ = self.filter_mode(input_count)
@@ -750,7 +795,13 @@ class Recommender:
             candidate_bonus = min(12.0, candidate_hits * 4.0)
             metrics["candidate_hits"] = candidate_hits
             metrics["candidate_bonus"] = candidate_bonus
-            score = self.category_score(metrics, category) + candidate_bonus
+            base_score = (
+                self.strategy_score(metrics, strategy)
+                if category == "추천조합"
+                else self.category_score(metrics, category)
+            )
+            metrics["strategy"] = strategy
+            score = base_score + candidate_bonus
             candidates.append((score, combo, metrics))
 
         candidates.sort(key=lambda x: (-x[0], x[1]))
@@ -762,6 +813,7 @@ class Recommender:
                 fixed_numbers=fixed_numbers,
                 excluded_numbers=excluded_numbers,
                 candidate_numbers=candidate_numbers,
+                strategy=strategy,
             )
             for score, combo, metrics in fallback:
                 if combo in existing:
@@ -1011,6 +1063,21 @@ class MainWindow(QMainWindow):
         )
         self.rec_category.currentTextChanged.connect(self.generate_recommendations)
         lay.addWidget(self.rec_category)
+
+        strategy_row = QHBoxLayout()
+        strategy_label = QLabel("추천 전략")
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItems(
+            ["균형형", "출현형", "동반수형", "트리플형", "최근형", "AI Ultimate"]
+        )
+        self.strategy_combo.currentTextChanged.connect(self.generate_recommendations)
+        strategy_row.addWidget(strategy_label)
+        strategy_row.addWidget(self.strategy_combo)
+
+        self.strategy_battle_btn = QPushButton("전략 배틀 백테스트")
+        self.strategy_battle_btn.clicked.connect(self.run_strategy_battle)
+        strategy_row.addWidget(self.strategy_battle_btn)
+        lay.addLayout(strategy_row)
 
         self.rec_status = QLabel(
             "역대 Excel을 불러오면 자체추천이 자동 계산됩니다.\n"
@@ -1386,11 +1453,13 @@ class MainWindow(QMainWindow):
                 fixed_numbers = ()
                 excluded_numbers = ()
                 candidate_numbers = ()
+                strategy = "자체추천"
             else:
                 weights = self.source_weights()
                 fixed_numbers = self.fixed_numbers()
                 excluded_numbers = self.excluded_numbers()
                 candidate_numbers = self.candidate_numbers()
+                strategy = self.strategy_combo.currentText()
                 self.validate_special_numbers(
                     weights,
                     fixed_numbers,
@@ -1408,7 +1477,7 @@ class MainWindow(QMainWindow):
                     return
                 filter_name, filter_desc = recommender.filter_mode(len(weights))
                 self.rec_status.setText(
-                    f"{category} 100조합 계산 중 · {filter_desc}"
+                    f"{category} 100조합 계산 중 · {filter_desc} · 전략: {strategy}"
                 )
                 self.statusBar().showMessage(
                     f"{category} 계산 중 · {filter_name} 필터"
@@ -1424,6 +1493,7 @@ class MainWindow(QMainWindow):
                     fixed_numbers=fixed_numbers,
                     excluded_numbers=excluded_numbers,
                     candidate_numbers=candidate_numbers,
+                    strategy=strategy,
                 )
             if not self.recommendations:
                 QMessageBox.information(
@@ -1517,6 +1587,144 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "추천 오류", str(e))
 
 
+    def run_strategy_battle(self) -> None:
+        if len(self.analyzer.draws) < 120:
+            QMessageBox.information(
+                self,
+                "데이터 부족",
+                "전략 배틀은 최소 120회 이상의 역대 데이터가 필요합니다.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "전략 배틀",
+            "최근 100회를 과거 데이터만 사용해 백테스트합니다.\n"
+            "PC 성능에 따라 1~3분 정도 걸릴 수 있습니다. 실행할까요?",
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        self.strategy_battle_btn.setEnabled(False)
+        self.rec_status.setText("전략 배틀 준비 중...")
+        QApplication.processEvents()
+
+        try:
+            strategies = list(Recommender.STRATEGY_WEIGHTS)
+            stats = {
+                name: {
+                    "three_plus": 0,
+                    "four_plus": 0,
+                    "five_plus": 0,
+                    "six": 0,
+                    "hit_sum": 0,
+                    "rounds": 0,
+                }
+                for name in strategies
+            }
+
+            draws = self.analyzer.draws
+            start_index = max(20, len(draws) - 100)
+
+            for test_no, target_index in enumerate(
+                range(start_index, len(draws)), 1
+            ):
+                history = draws[:target_index]
+                target = set(draws[target_index].numbers)
+
+                temp = LottoAnalyzer()
+                temp.draws = list(history)
+                temp._analyze()
+                recommender = Recommender(temp)
+
+                # 과거 출현빈도 상위 15개를 입력번호로 가정해 전략별 TOP10 생성
+                ranked_numbers = [
+                    n for n, _ in temp.number_counts.most_common(15)
+                ]
+                source_weights = Counter({
+                    n: max(1, temp.number_counts[n])
+                    for n in ranked_numbers
+                })
+
+                for strategy in strategies:
+                    rows = recommender.generate(
+                        source_weights,
+                        10,
+                        20,
+                        300,
+                        True,
+                        "추천조합",
+                        strategy=strategy,
+                    )
+                    best_hit = max(
+                        (len(target & set(combo)) for _, combo, _ in rows),
+                        default=0,
+                    )
+                    item = stats[strategy]
+                    item["rounds"] += 1
+                    item["hit_sum"] += best_hit
+                    if best_hit >= 3:
+                        item["three_plus"] += 1
+                    if best_hit >= 4:
+                        item["four_plus"] += 1
+                    if best_hit >= 5:
+                        item["five_plus"] += 1
+                    if best_hit >= 6:
+                        item["six"] += 1
+
+                if test_no % 5 == 0:
+                    self.rec_status.setText(
+                        f"전략 배틀 진행 중 · {test_no}/100회"
+                    )
+                    QApplication.processEvents()
+
+            rows = []
+            for strategy, item in stats.items():
+                rounds = max(1, item["rounds"])
+                average = item["hit_sum"] / rounds
+                battle_score = (
+                    item["three_plus"] * 1
+                    + item["four_plus"] * 3
+                    + item["five_plus"] * 10
+                    + item["six"] * 50
+                    + average * 10
+                )
+                rows.append((battle_score, strategy, item, average))
+
+            rows.sort(reverse=True)
+
+            lines = [
+                "최근 100회 전략 배틀 결과",
+                "각 회차마다 이전 회차 데이터만 사용하고 전략별 TOP10 중 최고 적중을 비교합니다.",
+                "",
+            ]
+            for rank, (_, strategy, item, average) in enumerate(rows, 1):
+                lines.append(
+                    f"{rank}위 {strategy} | 평균 최고적중 {average:.2f}개 | "
+                    f"3개+ {item['three_plus']}회 | 4개+ {item['four_plus']}회 | "
+                    f"5개+ {item['five_plus']}회 | 6개 {item['six']}회"
+                )
+
+            result_text = "\n".join(lines)
+            self.detail_box.setPlainText(result_text)
+            self.rec_status.setText(
+                f"전략 배틀 완료 · 1위: {rows[0][1]}"
+            )
+            QMessageBox.information(
+                self,
+                "전략 배틀 완료",
+                f"최근 100회 기준 1위 전략은 '{rows[0][1]}'입니다.\n"
+                "자세한 결과는 추천 결과 아래 상세창에서 확인하세요.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "전략 배틀 오류",
+                f"{exc}\n\n{traceback.format_exc(limit=3)}",
+            )
+        finally:
+            self.strategy_battle_btn.setEnabled(True)
+
     def show_recommend_detail(self, row: int, _column: int) -> None:
         if row < 0 or row >= len(self.recommendations):
             return
@@ -1550,6 +1758,7 @@ class MainWindow(QMainWindow):
         text = (
             f"추천조합: {' · '.join(map(str, combo))}\n"
             f"추천신뢰도: {confidence:.1f}점 ({grade}등급)\n"
+            f"추천전략: {metrics.get('strategy', '자동')}\n"
             f"추천이유: {reason}\n"
             f"합계: {sum(combo)} / 홀수 {sum(n % 2 for n in combo)}개 / "
             f"고번호 {sum(n >= 23 for n in combo)}개\n\n"
@@ -1594,6 +1803,7 @@ class MainWindow(QMainWindow):
         for rank, (score, combo, metrics) in enumerate(self.recommendations, 1):
             rows.append({
                 "카테고리": category,
+                "추천전략": metrics.get("strategy", "자체추천"),
                 "순위": rank,
                 "번호1": combo[0], "번호2": combo[1], "번호3": combo[2],
                 "번호4": combo[3], "번호5": combo[4], "번호6": combo[5],
