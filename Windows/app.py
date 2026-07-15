@@ -22,6 +22,7 @@ import base64
 import os
 import subprocess
 import traceback
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
@@ -30,7 +31,7 @@ from typing import Iterable
 
 import pandas as pd
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QFont, QColor, QBrush
+from PySide6.QtGui import QAction, QFont, QColor, QBrush, QImage
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
@@ -39,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "5.6.0"
+VERSION = "5.7.0"
 
 
 
@@ -242,6 +243,7 @@ class Recommender:
         "동반수": "pair",
         "트리플": "triple",
         "최근패턴": "recent",
+        "통합데이터추천": "mixed",
         "자체추천": "self",
     }
 
@@ -427,6 +429,239 @@ class Recommender:
             strategy, self.STRATEGY_WEIGHTS["균형형"]
         )
         return sum(metrics.get(key, 0.0) * weight for key, weight in weights.items())
+
+    MIXED_PRESETS = {
+        "입력중심형": (0.50, 0.20, 0.20, 0.10),
+        "최근중심형": (0.25, 0.40, 0.25, 0.10),
+        "균형형": (0.30, 0.25, 0.25, 0.20),
+        "장기형": (0.20, 0.15, 0.25, 0.40),
+    }
+
+    @staticmethod
+    def _window_analyzer(draws: list[Draw], size: int) -> LottoAnalyzer:
+        analyzer = LottoAnalyzer()
+        analyzer.draws = list(draws[-min(size, len(draws)):])
+        analyzer._analyze()
+        return analyzer
+
+    @staticmethod
+    def _historical_combo_score(
+        combo: tuple[int, ...],
+        analyzer: LottoAnalyzer,
+    ) -> float:
+        max_number = max(analyzer.number_counts.values(), default=1)
+        max_pair = max(analyzer.pair_counts.values(), default=1)
+        max_triple = max(analyzer.triple_counts.values(), default=1)
+
+        number_score = (
+            sum(analyzer.number_counts[n] for n in combo)
+            / max(1, max_number * 6)
+            * 100
+        )
+        pair_values = sorted(
+            (analyzer.pair_counts[p] for p in combinations(combo, 2)),
+            reverse=True,
+        )
+        pair_score = sum(pair_values[:5]) / max(1, max_pair * 5) * 100
+
+        triple_values = sorted(
+            (analyzer.triple_counts[t] for t in combinations(combo, 3)),
+            reverse=True,
+        )
+        triple_score = sum(triple_values[:5]) / max(1, max_triple * 5) * 100
+
+        odd = sum(n % 2 for n in combo)
+        high = sum(n >= 23 for n in combo)
+        total = sum(combo)
+        structure = 100.0
+        structure -= abs(odd - 3) * 12
+        structure -= abs(high - 3) * 10
+        if total < 100:
+            structure -= (100 - total) * 0.8
+        elif total > 180:
+            structure -= (total - 180) * 0.8
+        structure = max(0.0, min(100.0, structure))
+
+        return (
+            number_score * 0.35
+            + pair_score * 0.30
+            + triple_score * 0.20
+            + structure * 0.15
+        )
+
+    def _auto_mixed_preset(
+        self,
+        source_weights: Counter[int],
+    ) -> str:
+        """최근 20회를 검증구간으로 사용해 네 혼합비율 중 하나를 빠르게 선택합니다."""
+        if len(self.a.draws) < 120:
+            return "균형형"
+
+        history = self.a.draws[:-20]
+        targets = self.a.draws[-20:]
+        target_counts = Counter()
+        for draw in targets:
+            target_counts.update(draw.numbers)
+
+        windows = {
+            100: self._window_analyzer(history, 100),
+            500: self._window_analyzer(history, 500),
+            1000: self._window_analyzer(history, 1000),
+        }
+        max_input = max(source_weights.values(), default=1)
+        scores = {}
+
+        for preset, weights in self.MIXED_PRESETS.items():
+            input_w, w100, w500, w1000 = weights
+            number_scores = {}
+
+            for number in range(1, 46):
+                input_score = source_weights[number] / max_input * 100
+                history_scores = []
+                for size in (100, 500, 1000):
+                    analyzer = windows[size]
+                    max_count = max(analyzer.number_counts.values(), default=1)
+                    history_scores.append(
+                        analyzer.number_counts[number] / max_count * 100
+                    )
+
+                number_scores[number] = (
+                    input_score * input_w
+                    + history_scores[0] * w100
+                    + history_scores[1] * w500
+                    + history_scores[2] * w1000
+                )
+
+            top_numbers = [
+                n for n, _ in sorted(
+                    number_scores.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:15]
+            ]
+            scores[preset] = sum(target_counts[n] for n in top_numbers)
+
+        return max(scores, key=scores.get)
+
+    def generate_mixed(
+        self,
+        source_weights: Counter[int],
+        count: int,
+        preset: str,
+        fixed_numbers: tuple[int, ...] = (),
+        excluded_numbers: tuple[int, ...] = (),
+        candidate_numbers: tuple[int, ...] = (),
+    ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
+        """입력번호와 최근 100·500·1000회 데이터를 실제 추천점수에 혼합합니다."""
+        if len(source_weights) < 6:
+            raise ValueError("통합데이터추천은 입력번호가 최소 6개 필요합니다.")
+
+        fixed_set = set(fixed_numbers)
+        excluded_set = set(excluded_numbers)
+        candidate_set = set(candidate_numbers)
+
+        if preset == "자동최적형":
+            applied_preset = self._auto_mixed_preset(source_weights)
+        else:
+            applied_preset = preset
+
+        input_w, w100, w500, w1000 = self.MIXED_PRESETS.get(
+            applied_preset,
+            self.MIXED_PRESETS["균형형"],
+        )
+
+        analyzers = {
+            100: self._window_analyzer(self.a.draws, 100),
+            500: self._window_analyzer(self.a.draws, 500),
+            1000: self._window_analyzer(self.a.draws, 1000),
+        }
+
+        max_input = max(source_weights.values(), default=1)
+        number_blend = {}
+        for number in range(1, 46):
+            input_score = source_weights[number] / max_input * 100
+            window_scores = []
+            for size in (100, 500, 1000):
+                analyzer = analyzers[size]
+                max_count = max(analyzer.number_counts.values(), default=1)
+                window_scores.append(
+                    analyzer.number_counts[number] / max_count * 100
+                )
+            number_blend[number] = (
+                input_score * input_w
+                + window_scores[0] * w100
+                + window_scores[1] * w500
+                + window_scores[2] * w1000
+            )
+
+        ranked = [
+            number for number, _ in sorted(
+                number_blend.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if number not in excluded_set
+        ]
+
+        # 입력번호는 우선 보존하고, 역사 데이터 상위번호로 후보군을 확장합니다.
+        pool = list(dict.fromkeys(
+            list(source_weights.keys()) + ranked + list(fixed_set | candidate_set)
+        ))
+        pool = [n for n in pool if n not in excluded_set]
+
+        mandatory = list(fixed_set | candidate_set)
+        selected = []
+        for number in mandatory + pool:
+            if number not in selected:
+                selected.append(number)
+            if len(selected) >= 18:
+                break
+        pool = sorted(selected)
+
+        candidates = []
+        for combo in combinations(pool, 6):
+            combo_set = set(combo)
+            if fixed_set and not fixed_set.issubset(combo_set):
+                continue
+            if excluded_set & combo_set:
+                continue
+            if combo in self.a.first_prize or combo in self.a.second_prize:
+                continue
+            if not 20 <= sum(combo) <= 300:
+                continue
+
+            base_metrics = dict(self.metrics(combo, source_weights))
+            input_score = base_metrics["input"]
+            score100 = self._historical_combo_score(combo, analyzers[100])
+            score500 = self._historical_combo_score(combo, analyzers[500])
+            score1000 = self._historical_combo_score(combo, analyzers[1000])
+
+            candidate_hits = len(combo_set & candidate_set)
+            candidate_bonus = min(12.0, candidate_hits * 4.0)
+            mixed_score = (
+                input_score * input_w
+                + score100 * w100
+                + score500 * w500
+                + score1000 * w1000
+                + candidate_bonus
+            )
+
+            base_metrics.update({
+                "mixed": mixed_score,
+                "mixed_preset": applied_preset,
+                "mixed_input_weight": input_w,
+                "mixed_100_weight": w100,
+                "mixed_500_weight": w500,
+                "mixed_1000_weight": w1000,
+                "score100": score100,
+                "score500": score500,
+                "score1000": score1000,
+                "candidate_hits": candidate_hits,
+                "candidate_bonus": candidate_bonus,
+                "strategy": f"통합-{applied_preset}",
+            })
+            candidates.append((mixed_score, combo, base_metrics))
+
+        candidates.sort(key=lambda row: (-row[0], row[1]))
+        return self.select_diverse(candidates, count)
 
     def category_score(self, metrics: dict[str, float], category: str) -> float:
         key = self.CATEGORY_NAMES.get(category, "composite")
@@ -835,6 +1070,8 @@ class MainWindow(QMainWindow):
         self.analyzer = LottoAnalyzer()
         self.photo_paths: list[str] = []
         self.recommendations: list[tuple[float, tuple[int, ...], dict[str, float]]] = []
+        self.ocr_cache: dict[tuple[str, int, int], list[int]] = {}
+        self.suspend_auto_recommend = False
 
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.resize(1320, 850)
@@ -877,7 +1114,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(sub)
         lay.addSpacing(20)
 
-        names = ["번호 입력", "추천조합", "나온횟수", "동반수", "트리플", "최근패턴", "자체추천"]
+        names = [
+            "번호 입력", "추천조합", "나온횟수", "동반수", "트리플",
+            "최근패턴", "통합데이터추천", "자체추천"
+        ]
         for i, name in enumerate(names):
             b = QPushButton(name)
             if i == 0:
@@ -1059,7 +1299,10 @@ class MainWindow(QMainWindow):
 
         self.rec_category = QComboBox()
         self.rec_category.addItems(
-            ["추천조합", "나온횟수", "동반수", "트리플", "최근패턴", "자체추천"]
+            [
+                "추천조합", "나온횟수", "동반수", "트리플",
+                "최근패턴", "통합데이터추천", "자체추천"
+            ]
         )
         self.rec_category.currentTextChanged.connect(self.generate_recommendations)
         lay.addWidget(self.rec_category)
@@ -1078,6 +1321,24 @@ class MainWindow(QMainWindow):
         self.strategy_battle_btn.clicked.connect(self.run_strategy_battle)
         strategy_row.addWidget(self.strategy_battle_btn)
         lay.addLayout(strategy_row)
+
+        mixed_row = QHBoxLayout()
+        mixed_label = QLabel("통합데이터 비율")
+        self.mixed_preset_combo = QComboBox()
+        self.mixed_preset_combo.addItems(
+            ["입력중심형", "최근중심형", "균형형", "장기형", "자동최적형"]
+        )
+        self.mixed_preset_combo.currentTextChanged.connect(
+            self.generate_recommendations
+        )
+        mixed_row.addWidget(mixed_label)
+        mixed_row.addWidget(self.mixed_preset_combo)
+        mixed_help = QLabel(
+            "입력번호 + 최근 100회 + 500회 + 1000회 데이터를 섞어 새 조합을 만듭니다."
+        )
+        mixed_help.setWordWrap(True)
+        mixed_row.addWidget(mixed_help, 1)
+        lay.addLayout(mixed_row)
 
         self.rec_status = QLabel(
             "역대 Excel을 불러오면 자체추천이 자동 계산됩니다.\n"
@@ -1175,17 +1436,56 @@ class MainWindow(QMainWindow):
                 f"{exc}\n\n{traceback.format_exc(limit=3)}",
             )
 
+    def prepare_ocr_image(self, image_path: str) -> tuple[str, str | None]:
+        """고해상도 사진을 OCR에 충분한 크기로 축소해 처리시간을 줄입니다."""
+        image = QImage(image_path)
+        if image.isNull():
+            return image_path, None
+
+        max_side = max(image.width(), image.height())
+        if max_side <= 1800:
+            return image_path, None
+
+        scaled = image.scaled(
+            1800,
+            1800,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="taegyeong_ocr_",
+            suffix=".jpg",
+            delete=False,
+        )
+        temp_path = temp_file.name
+        temp_file.close()
+        if not scaled.save(temp_path, "JPG", 88):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            return image_path, None
+        return temp_path, temp_path
+
     def run_windows_ocr(self, image_path: str) -> list[int]:
-        """외부 파일 없이 Windows 10/11 내장 OCR을 호출합니다."""
+        """Windows OCR을 축소 이미지와 캐시로 빠르게 호출합니다."""
         if sys.platform != "win32":
             raise RuntimeError("사진 OCR은 Windows 10/11에서만 사용할 수 있습니다.")
+
+        source_path = Path(image_path).resolve()
+        stat = source_path.stat()
+        cache_key = (str(source_path), stat.st_mtime_ns, stat.st_size)
+        if cache_key in self.ocr_cache:
+            return list(self.ocr_cache[cache_key])
+
+        prepared_path, temp_path = self.prepare_ocr_image(str(source_path))
 
         encoded = base64.b64encode(
             WINDOWS_OCR_PS.encode("utf-16le")
         ).decode("ascii")
 
         env = os.environ.copy()
-        env["LOTTO_OCR_IMAGE"] = str(Path(image_path).resolve())
+        env["LOTTO_OCR_IMAGE"] = prepared_path
 
         command = [
             "powershell.exe",
@@ -1234,14 +1534,23 @@ class MainWindow(QMainWindow):
             raise RuntimeError(payload.get("error", "Windows OCR 처리 실패"))
 
         numbers = payload.get("numbers") or []
-        return [int(n) for n in numbers if 1 <= int(n) <= 45]
+        result = [int(n) for n in numbers if 1 <= int(n) <= 45]
+        self.ocr_cache[cache_key] = list(result)
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return result
 
     def append_ocr_numbers(self, numbers: list[int]) -> None:
         if not numbers:
             return
         current = self.source_input.toPlainText().rstrip()
         added = " ".join(map(str, numbers))
+        self.source_input.blockSignals(True)
         self.source_input.setPlainText((current + "\n" + added).strip())
+        self.source_input.blockSignals(False)
         self.update_source_counts()
 
     def add_photos(self) -> None:
@@ -1254,6 +1563,7 @@ class MainWindow(QMainWindow):
 
         all_numbers: list[int] = []
         failures: list[str] = []
+        self.suspend_auto_recommend = True
 
         for path in paths:
             if path not in self.photo_paths:
@@ -1267,6 +1577,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 failures.append(f"{Path(path).name}: {exc}")
 
+        self.suspend_auto_recommend = False
         if all_numbers:
             self.append_ocr_numbers(all_numbers)
             self.statusBar().showMessage(
@@ -1402,8 +1713,9 @@ class MainWindow(QMainWindow):
                     self.excel_status.text()
                     + "\n입력번호 준비 완료 — 모든 추천 항목을 사용할 수 있습니다."
                 )
-                # 사진 또는 직접 입력이 들어오면 자동으로 추천조합 화면으로 이동해 계산
-                self.show_recommend_category("추천조합")
+                # 여러 사진 처리 중에는 매 사진마다 100조합을 재계산하지 않습니다.
+                if not self.suspend_auto_recommend:
+                    self.show_recommend_category("추천조합")
             elif not self.analyzer.draws:
                 self.source_summary.setText(
                     self.source_summary.text()
@@ -1454,6 +1766,38 @@ class MainWindow(QMainWindow):
                 excluded_numbers = ()
                 candidate_numbers = ()
                 strategy = "자체추천"
+            elif category == "통합데이터추천":
+                weights = self.source_weights()
+                fixed_numbers = self.fixed_numbers()
+                excluded_numbers = self.excluded_numbers()
+                candidate_numbers = self.candidate_numbers()
+                self.validate_special_numbers(
+                    weights,
+                    fixed_numbers,
+                    excluded_numbers,
+                    candidate_numbers,
+                )
+                if len(weights) < 6:
+                    self.rec_table.setRowCount(0)
+                    self.rec_status.setText(
+                        "통합데이터추천은 입력번호가 최소 6개 필요합니다."
+                    )
+                    return
+                preset = self.mixed_preset_combo.currentText()
+                self.rec_status.setText(
+                    f"통합데이터추천 계산 중 · 입력번호 + 최근100/500/1000회 · {preset}"
+                )
+                self.statusBar().showMessage("통합데이터추천 100조합 계산 중...")
+                QApplication.processEvents()
+                self.recommendations = recommender.generate_mixed(
+                    weights,
+                    100,
+                    preset,
+                    fixed_numbers=fixed_numbers,
+                    excluded_numbers=excluded_numbers,
+                    candidate_numbers=candidate_numbers,
+                )
+                strategy = f"통합-{preset}"
             else:
                 weights = self.source_weights()
                 fixed_numbers = self.fixed_numbers()
@@ -1541,7 +1885,7 @@ class MainWindow(QMainWindow):
                 # 현재 선택한 카테고리의 점수 칸을 강조
                 metric_column = {
                     "composite": 6, "input": 7, "pair": 8,
-                    "triple": 9, "recent": 10, "self": 5,
+                    "triple": 9, "recent": 10, "mixed": 5, "self": 5,
                 }[selected_key]
                 metric_value = metrics.get(selected_key, score)
                 item = self.rec_table.item(r - 1, metric_column)
@@ -1755,11 +2099,25 @@ class MainWindow(QMainWindow):
             for (a, b, c), count in recommender.triple_details(combo, 5)
         ]
 
+        mixed_detail = ""
+        if metrics.get("mixed_preset"):
+            mixed_detail = (
+                f"통합비율: {metrics['mixed_preset']} "
+                f"(입력 {metrics['mixed_input_weight']:.0%} / "
+                f"100회 {metrics['mixed_100_weight']:.0%} / "
+                f"500회 {metrics['mixed_500_weight']:.0%} / "
+                f"1000회 {metrics['mixed_1000_weight']:.0%})\n"
+                f"구간점수: 100회 {metrics['score100']:.1f} / "
+                f"500회 {metrics['score500']:.1f} / "
+                f"1000회 {metrics['score1000']:.1f}\n"
+            )
+
         text = (
             f"추천조합: {' · '.join(map(str, combo))}\n"
             f"추천신뢰도: {confidence:.1f}점 ({grade}등급)\n"
             f"추천전략: {metrics.get('strategy', '자동')}\n"
             f"추천이유: {reason}\n"
+            f"{mixed_detail}"
             f"합계: {sum(combo)} / 홀수 {sum(n % 2 for n in combo)}개 / "
             f"고번호 {sum(n >= 23 for n in combo)}개\n\n"
             f"[동반출현 횟수]\n" + "\n".join(pair_lines) +
@@ -1804,6 +2162,11 @@ class MainWindow(QMainWindow):
             rows.append({
                 "카테고리": category,
                 "추천전략": metrics.get("strategy", "자체추천"),
+                "통합프리셋": metrics.get("mixed_preset", ""),
+                "입력비중": metrics.get("mixed_input_weight", ""),
+                "최근100회비중": metrics.get("mixed_100_weight", ""),
+                "최근500회비중": metrics.get("mixed_500_weight", ""),
+                "최근1000회비중": metrics.get("mixed_1000_weight", ""),
                 "순위": rank,
                 "번호1": combo[0], "번호2": combo[1], "번호3": combo[2],
                 "번호4": combo[3], "번호5": combo[4], "번호6": combo[5],
