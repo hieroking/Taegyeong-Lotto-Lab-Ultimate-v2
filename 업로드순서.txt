@@ -1,0 +1,22 @@
+﻿太炅 Lotto Lab Ultimate v5.0 업로드 순서
+
+1. ZIP 압축을 풉니다.
+2. 압축을 풀면 아래 항목이 바로 보여야 합니다.
+   - Windows
+   - Android
+   - .github
+   - README.md
+3. 새 저장소 Taegyeong-Lotto-Lab-Ultimate-v2에서
+   uploading an existing file 을 클릭합니다.
+4. 위 4개 항목을 모두 선택해 업로드합니다.
+5. Commit changes를 누릅니다.
+6. Actions 탭에서 다음 두 작업을 확인합니다.
+   - Windows EXE 자동 빌드
+   - Android APK 자동 빌드
+7. 초록색 체크 후 각 실행을 열고 Artifacts에서 다운로드합니다.
+
+중요
+- ZIP 파일 자체를 올리면 안 됩니다.
+- 반드시 압축을 푼 내부 파일과 폴더를 올리세요.
+- .github 폴더가 숨김 폴더라 안 보이면 파일 탐색기에서
+  보기 → 숨긴 항목을 체크하세요.

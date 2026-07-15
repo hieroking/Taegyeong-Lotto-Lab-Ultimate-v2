@@ -1,0 +1,20 @@
+﻿太炅 Lotto Lab Android v1.1 — 컴퓨터 업로드용
+
+압축을 풀면 바로 보이는 항목:
+- app
+- .github
+- build.gradle.kts
+- settings.gradle.kts
+- gradle.properties
+
+업로드:
+1. Taegyeong-Lotto-Lab-Ultimate 저장소를 엽니다.
+2. Add file → Upload files
+3. 압축을 푼 모든 항목을 한꺼번에 업로드합니다.
+4. Commit changes
+5. Actions → Android APK 자동 빌드 확인
+6. 성공 후 Artifacts → TaegyeongLottoLab-Android-v1.1 다운로드
+
+중요:
+- .github/workflows/android-build.yml 경로가 정확해야 합니다.
+- ZIP 자체가 아니라 압축을 푼 내부 파일과 폴더를 올리세요.
