@@ -1,0 +1,16 @@
+﻿포함 파일 요약
+
+PC_업데이트팩/
+  - 업데이트_실행.bat
+  - 업데이트_도우미.ps1
+  - payload/
+
+통합프로젝트_v6.0/
+  - Windows/
+  - Android/
+  - .github/workflows/
+  - README.md
+
+최상위
+  - PC_모바일_통합도우미.bat
+  - 사용방법.txt

@@ -1,0 +1,18 @@
+﻿太炅 Lotto Lab 업데이트 팩 v1.0
+
+사용 방법
+1. ZIP 압축을 풉니다.
+2. 폴더 안의 '업데이트_실행.bat'를 더블클릭합니다.
+3. 컴퓨터에 있는 GitHub 저장소 폴더 경로를 입력합니다.
+   예:
+   C:\Users\사용자이름\Documents\Taegyeong-Lotto-Lab-Ultimate-v2
+4. 최신 Windows, Android, .github 파일이 자동으로 덮어써집니다.
+5. 컴퓨터에 Git이 설치되어 있고 저장소를 Clone한 폴더라면
+   자동 Commit/Push까지 선택할 수 있습니다.
+6. Git이 없으면 파일 준비까지만 완료되며,
+   GitHub 웹의 Add file → Upload files로 올리면 됩니다.
+
+중요
+- 저장소 폴더 안의 Windows, Android, .github 폴더는 최신 버전으로 교체됩니다.
+- 개인적으로 추가한 파일이 해당 폴더 안에 있다면 먼저 백업하세요.
+- GitHub 아이디와 비밀번호는 이 프로그램이 저장하지 않습니다.

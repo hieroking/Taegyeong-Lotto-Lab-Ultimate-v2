@@ -1,0 +1,45 @@
+﻿太炅 Lotto Lab PC·모바일 통합팩 v1.0
+
+이 통합팩에는 다음이 포함되어 있습니다.
+
+1. PC_업데이트팩
+- Windows용 최신 프로젝트 파일
+- Android용 최신 프로젝트 파일
+- GitHub Actions 설정
+- 업데이트_실행.bat / 업데이트_도우미.ps1
+
+2. 통합프로젝트_v6.0
+- Windows 프로그램 소스
+- Android 앱 소스
+- GitHub Actions
+- Android 빌드 오류 수정
+  · Java/Kotlin 17 통일
+  · minSdk 26
+  · setContent import 추가
+  · compileSdk 35 설정 보완
+
+3. PC_모바일_통합도우미.bat
+- PC에서 더블클릭하면 메뉴가 열립니다.
+- PC 업데이트팩 실행 또는 통합프로젝트 폴더 열기를 선택할 수 있습니다.
+
+PC에서 사용하는 방법
+1. 이 ZIP 압축을 풉니다.
+2. PC_모바일_통합도우미.bat를 더블클릭합니다.
+3. 1번을 선택하면 업데이트팩이 실행됩니다.
+4. GitHub 저장소 폴더 경로를 입력하면 Windows/Android/.github가 교체됩니다.
+5. GitHub Actions에서 Windows EXE를 생성합니다.
+6. 생성된 EXE를 PC에서 사용합니다.
+
+모바일에서 사용하는 방법
+1. 통합프로젝트_v6.0 전체를 GitHub에 업로드합니다.
+2. Actions → Android APK 자동 빌드를 실행합니다.
+3. 성공 후 Artifacts에서 APK를 다운로드합니다.
+4. APK 파일을 삼성 갤럭시에 설치합니다.
+5. ZIP 파일은 설치 파일이 아닙니다. 모바일 설치에는 반드시 .apk 파일이 필요합니다.
+
+중요
+- 이 통합팩 자체는 ZIP이므로 휴대폰에 바로 설치할 수 없습니다.
+- PC 설치는 EXE, 모바일 설치는 APK가 필요합니다.
+- 이 팩은 EXE/APK를 자동 생성할 수 있는 프로젝트와 업데이트 도우미를 한데 묶은 것입니다.
+- 현재 실제 APK 바이너리는 이 대화에 업로드되지 않아 포함하지 못했습니다.
+  GitHub Actions가 성공하면 생성된 APK를 다운로드해 설치하면 됩니다.
