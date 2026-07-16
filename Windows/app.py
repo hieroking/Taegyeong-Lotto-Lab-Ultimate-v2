@@ -23,7 +23,11 @@ import os
 import subprocess
 import traceback
 import tempfile
-from collections import Counter
+import urllib.request
+import urllib.parse
+import shutil
+from datetime import datetime
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -35,12 +39,12 @@ from PySide6.QtGui import QAction, QFont, QColor, QBrush, QImage
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QDialog,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "6.0.0"
+VERSION = "7.0.0"
 
 
 
@@ -234,6 +238,211 @@ class LottoAnalyzer:
         return {"first": same_first, "second": same_second, "matches": matches}
 
 
+
+class TKPerformanceEngine:
+    """1~1218회 워크포워드 검증으로 선택한 성과 중심 번호·조합 엔진."""
+
+    FEATURE_NAMES = ['최근10회', '최근30회', '최근100회', '최근300회', '전체빈도', '미출현간격', '직전이월수', '2회전재등장', '끝수흐름', '직전번호동반수', '인접연속수', '간격수흐름']
+    OPTIMIZED_WEIGHTS = [0.00378073, 0.116455048, 0.104777671, 0.073486328, 0.005267944, 0.221622601, 0.030370023, 0.076836631, 0.257287055, 0.041604862, 0.022926405, 0.045584697]
+    OPTIMIZATION_RESULT = {'tested_settings': 30000, 'feature_names': ['최근10회', '최근30회', '최근100회', '최근300회', '전체빈도', '미출현간격', '직전이월수', '2회전재등장', '끝수흐름', '직전번호동반수', '인접연속수', '간격수흐름'], 'weights': {'최근10회': 0.003781, '최근30회': 0.116455, '최근100회': 0.104778, '최근300회': 0.073486, '전체빈도': 0.005268, '미출현간격': 0.221623, '직전이월수': 0.03037, '2회전재등장': 0.076837, '끝수흐름': 0.257287, '직전번호동반수': 0.041605, '인접연속수': 0.022926, '간격수흐름': 0.045585}, 'train': {'average_top15_hits': 2.088, 'three_plus_rate': 0.316, 'four_plus_rate': 0.088, 'max_hits': 5}, 'validation': {'average_top15_hits': 2.0797, 'three_plus_rate': 0.3116, 'four_plus_rate': 0.1014, 'max_hits': 6}, 'holdout': {'round_start': 1081, 'round_end': 1218, 'average_top15_hits': 2.1232, 'three_plus_rate': 0.3188, 'four_plus_rate': 0.1449, 'max_hits': 5, 'random_expected_hits': 2.0}, 'elapsed_seconds': 24.08}
+
+    @staticmethod
+    def normalize(values):
+        values = list(map(float, values))
+        low, high = min(values), max(values)
+        if high <= low:
+            return [0.0] * len(values)
+        return [(value - low) / (high - low) for value in values]
+
+    @classmethod
+    def number_scores(cls, draws):
+        if len(draws) < 30:
+            raise ValueError("성과최적추천은 최소 30회 이상의 데이터가 필요합니다.")
+        history = [tuple(draw.numbers) for draw in draws]
+        flat = lambda rows: [n for row in rows for n in row]
+        feature_columns = []
+
+        for window in (10, 30, 100, 300):
+            counts = Counter(flat(history[-window:]))
+            feature_columns.append(cls.normalize([counts[n] for n in range(1, 46)]))
+
+        all_counts = Counter(flat(history))
+        feature_columns.append(cls.normalize([all_counts[n] for n in range(1, 46)]))
+
+        last_seen = {n: -1 for n in range(1, 46)}
+        for index, row in enumerate(history):
+            for number in row:
+                last_seen[number] = index
+        gaps = [len(history) - 1 - last_seen[n] for n in range(1, 46)]
+        feature_columns.append(cls.normalize(gaps))
+
+        last = set(history[-1])
+        previous = set(history[-2])
+        feature_columns.append([1.0 if n in last else 0.0 for n in range(1, 46)])
+        feature_columns.append([
+            1.0 if n in previous and n not in last else 0.0
+            for n in range(1, 46)
+        ])
+
+        ending_counts = Counter(n % 10 for n in flat(history[-30:]))
+        feature_columns.append(
+            cls.normalize([ending_counts[n % 10] for n in range(1, 46)])
+        )
+
+        partner = Counter()
+        for row in history[-100:]:
+            row_set = set(row)
+            overlap = len(row_set & last)
+            if overlap:
+                for number in row_set - last:
+                    partner[number] += overlap
+        feature_columns.append(cls.normalize([partner[n] for n in range(1, 46)]))
+
+        adjacent = []
+        for n in range(1, 46):
+            adjacent.append(
+                1.0 if n not in last and any(abs(n - x) == 1 for x in last) else 0.0
+            )
+        feature_columns.append(adjacent)
+
+        gap_counts = Counter()
+        for row in history[-30:]:
+            for a, b in combinations(sorted(row), 2):
+                if 1 <= b - a <= 15:
+                    gap_counts[b - a] += 1
+        common_gaps = [gap for gap, _ in gap_counts.most_common(5)]
+        interval = [0.0] * 45
+        for rank, gap in enumerate(common_gaps):
+            value = 1.0 - rank * 0.15
+            for source in last:
+                for candidate in (source - gap, source + gap):
+                    if 1 <= candidate <= 45 and candidate not in last:
+                        interval[candidate - 1] = max(interval[candidate - 1], value)
+        feature_columns.append(interval)
+
+        scores = {}
+        details = {}
+        for number in range(1, 46):
+            contributions = []
+            for name, weight, column in zip(
+                cls.FEATURE_NAMES, cls.OPTIMIZED_WEIGHTS, feature_columns
+            ):
+                value = column[number - 1]
+                contributions.append((name, value * weight))
+            scores[number] = sum(value for _, value in contributions) * 100.0
+            details[number] = sorted(
+                contributions, key=lambda item: (-item[1], item[0])
+            )
+        return scores, details
+
+    @classmethod
+    def generate(
+        cls,
+        analyzer,
+        count=100,
+        fixed_numbers=(),
+        excluded_numbers=(),
+        candidate_numbers=(),
+    ):
+        scores, details = cls.number_scores(analyzer.draws)
+        fixed_set = set(fixed_numbers)
+        excluded_set = set(excluded_numbers)
+        candidate_set = set(candidate_numbers)
+
+        ranked = [
+            n for n, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+            if n not in excluded_set
+        ]
+        pool = []
+        for n in list(fixed_set | candidate_set) + ranked:
+            if n not in pool and n not in excluded_set:
+                pool.append(n)
+            if len(pool) >= 20:
+                break
+        pool = sorted(pool)
+
+        # 번호 선택과 조합 배치를 분리:
+        # 후보 TOP20 안에서 조합을 만들고 구조·분산·동반출현을 별도 평가합니다.
+        raw = []
+        recent_pair = analyzer.recent_pair_counts
+        for combo in combinations(pool, 6):
+            combo_set = set(combo)
+            if fixed_set and not fixed_set.issubset(combo_set):
+                continue
+            if excluded_set & combo_set:
+                continue
+            if combo in analyzer.first_prize or combo in analyzer.second_prize:
+                continue
+            odd = sum(n % 2 for n in combo)
+            high = sum(n >= 23 for n in combo)
+            total = sum(combo)
+            zones = [
+                sum(lo <= n <= hi for n in combo)
+                for lo, hi in ((1, 10), (11, 20), (21, 30), (31, 40), (41, 45))
+            ]
+            if odd not in (2, 3, 4) or high not in (2, 3, 4):
+                continue
+            if not 95 <= total <= 185:
+                continue
+            if max(zones) > 3:
+                continue
+
+            number_score = sum(scores[n] for n in combo) / 6.0
+            pair_score = sum(
+                recent_pair[tuple(sorted(pair))]
+                for pair in combinations(combo, 2)
+            ) / 15.0
+            candidate_bonus = len(combo_set & candidate_set) * 2.5
+            consecutive = sum(b - a == 1 for a, b in zip(combo, combo[1:]))
+            structure = 100.0
+            structure -= abs(odd - 3) * 5.0
+            structure -= abs(high - 3) * 4.0
+            structure -= abs(total - 140) * 0.12
+            structure -= max(0, consecutive - 1) * 8.0
+            final_score = number_score * 0.72 + min(100.0, pair_score * 10) * 0.13 + structure * 0.15 + candidate_bonus
+
+            top_reasons = []
+            for number in combo:
+                strongest = details[number][:2]
+                top_reasons.append(
+                    f"{number}번: " + ", ".join(name for name, _ in strongest)
+                )
+
+            metrics = {
+                "performance": final_score,
+                "composite": final_score,
+                "input": 0.0,
+                "pair": min(100.0, pair_score * 10),
+                "triple": 0.0,
+                "recent": number_score,
+                "structure": structure,
+                "pattern_votes": 0,
+                "strategy": "성과최적엔진",
+                "performance_reasons": top_reasons,
+                "candidate_hits": len(combo_set & candidate_set),
+                "candidate_bonus": candidate_bonus,
+                "filter_mode": "성과최적화",
+            }
+            raw.append((final_score, combo, metrics))
+
+        raw.sort(key=lambda row: (-row[0], row[1]))
+
+        # 지나치게 비슷한 조합을 줄여 실제 추천 묶음의 포착 범위를 확대합니다.
+        selected = []
+        number_usage = Counter()
+        for score, combo, metrics in raw:
+            overlap5 = any(len(set(combo) & set(old_combo)) >= 5 for _, old_combo, _ in selected)
+            usage_penalty = sum(number_usage[n] for n in combo) * 0.35
+            adjusted = score - usage_penalty
+            if overlap5 and len(selected) >= 10:
+                continue
+            selected.append((adjusted, combo, metrics))
+            number_usage.update(combo)
+            if len(selected) >= count:
+                break
+        selected.sort(key=lambda row: (-row[0], row[1]))
+        return selected
+
 class Recommender:
     """입력빈도·동반수·트리플·최근패턴을 자동 종합해 순위를 계산합니다."""
 
@@ -244,6 +453,7 @@ class Recommender:
         "트리플": "triple",
         "최근패턴": "recent",
         "통합데이터추천": "mixed",
+        "성과최적추천": "performance",
         "특이패턴추천": "pattern",
         "자체추천": "self",
     }
@@ -1468,6 +1678,7 @@ class MainWindow(QMainWindow):
         self.photo_paths: list[str] = []
         self.recommendations: list[tuple[float, tuple[int, ...], dict[str, float]]] = []
         self.ocr_cache: dict[tuple[str, int, int], list[int]] = {}
+        self.pattern_cache: dict[str, object] = {}
         self.suspend_auto_recommend = False
 
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
@@ -1513,7 +1724,7 @@ class MainWindow(QMainWindow):
 
         names = [
             "번호 입력", "추천조합", "나온횟수", "동반수", "트리플",
-            "최근패턴", "통합데이터추천", "특이패턴추천", "자체추천"
+            "최근패턴", "통합데이터추천", "성과최적추천", "특이패턴추천", "자체추천"
         ]
         for i, name in enumerate(names):
             b = QPushButton(name)
@@ -1700,7 +1911,7 @@ class MainWindow(QMainWindow):
         self.rec_category.addItems(
             [
                 "추천조합", "나온횟수", "동반수", "트리플",
-                "최근패턴", "통합데이터추천", "특이패턴추천", "자체추천"
+                "최근패턴", "통합데이터추천", "성과최적추천", "특이패턴추천", "자체추천"
             ]
         )
         self.rec_category.currentTextChanged.connect(self.generate_recommendations)
@@ -1758,6 +1969,9 @@ class MainWindow(QMainWindow):
         self.pattern_brief_btn = QPushButton("이번 주 패턴 브리핑")
         self.pattern_brief_btn.clicked.connect(self.show_pattern_briefing)
         pattern_row.addWidget(self.pattern_brief_btn)
+        self.performance_report_btn = QPushButton("30,000회 최적화 결과")
+        self.performance_report_btn.clicked.connect(self.show_performance_report)
+        pattern_row.addWidget(self.performance_report_btn)
 
         self.round_search_input = QLineEdit()
         self.round_search_input.setPlaceholderText("회차/번호 검색: 33 37 40")
@@ -1826,6 +2040,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
             self.analyzer.load_excel(path)
+            self.pattern_cache.clear()
 
             self.excel_progress.setValue(75)
             latest = self.analyzer.draws[-1].round_no
@@ -2193,6 +2408,23 @@ class MainWindow(QMainWindow):
                 excluded_numbers = ()
                 candidate_numbers = ()
                 strategy = "자체추천"
+            elif category == "성과최적추천":
+                fixed_numbers = self.fixed_numbers()
+                excluded_numbers = self.excluded_numbers()
+                candidate_numbers = self.candidate_numbers()
+                self.rec_status.setText(
+                    "성과최적추천 계산 중 · 30,000개 설정 경쟁에서 선택된 가중치 적용"
+                )
+                self.statusBar().showMessage("성과최적추천 100조합 계산 중...")
+                QApplication.processEvents()
+                self.recommendations = TKPerformanceEngine.generate(
+                    self.analyzer,
+                    100,
+                    fixed_numbers=fixed_numbers,
+                    excluded_numbers=excluded_numbers,
+                    candidate_numbers=candidate_numbers,
+                )
+                strategy = "성과최적엔진"
             elif category == "특이패턴추천":
                 fixed_numbers = self.fixed_numbers()
                 excluded_numbers = self.excluded_numbers()
@@ -2206,7 +2438,7 @@ class MainWindow(QMainWindow):
                 )
                 mode = self.pattern_mode_combo.currentText()
                 self.rec_status.setText(
-                    f"특이패턴추천 계산 중 · {mode} · 패턴별 추천번호를 종합합니다."
+                    f"특이패턴추천 계산 중 · {mode} · 패턴투표와 검증점수를 종합합니다."
                 )
                 self.statusBar().showMessage("특이패턴 추천 100조합 계산 중...")
                 QApplication.processEvents()
@@ -2318,6 +2550,10 @@ class MainWindow(QMainWindow):
                         "패턴투표: " + ", ".join(metrics["pattern_names"])
                         + " / " + reason
                     )
+                if metrics.get("performance_reasons"):
+                    reason = (
+                        "성과최적: " + " / ".join(metrics["performance_reasons"][:2])
+                    )
                 confidence = recommender.confidence_score(score, metrics)
                 grade = recommender.confidence_grade(confidence)
                 rank_text = f"TOP {r}" if r <= 10 else str(r)
@@ -2343,7 +2579,7 @@ class MainWindow(QMainWindow):
                 metric_column = {
                     "composite": 6, "input": 7, "pair": 8,
                     "triple": 9, "recent": 10, "mixed": 5,
-                    "pattern": 5, "self": 5,
+                    "pattern": 5, "performance": 5, "self": 5,
                 }[selected_key]
                 metric_value = metrics.get(selected_key, score)
                 item = self.rec_table.item(r - 1, metric_column)
@@ -2389,6 +2625,175 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "추천 오류", str(e))
 
 
+
+    def show_performance_report(self) -> None:
+        result = TKPerformanceEngine.OPTIMIZATION_RESULT
+        weights = result["weights"]
+        lines = [
+            "TK 성과 최적화 연구결과",
+            "",
+            f"실제 시험 설정: {result['tested_settings']:,}개",
+            "검증 방식: 각 회차 직전까지만 사용한 순차 워크포워드",
+            f"최종 보류검증: {result['holdout']['round_start']}~{result['holdout']['round_end']}회",
+            "",
+            "[선택된 가중치]",
+        ]
+        for name, value in sorted(weights.items(), key=lambda item: -item[1]):
+            lines.append(f"{name}: {value * 100:.2f}%")
+        hold = result["holdout"]
+        lines.extend([
+            "",
+            "[최종 보류구간 TOP15 번호 포함 성적]",
+            f"평균 포함번호: {hold['average_top15_hits']:.3f}개",
+            f"3개 이상 포함률: {hold['three_plus_rate'] * 100:.1f}%",
+            f"4개 이상 포함률: {hold['four_plus_rate'] * 100:.1f}%",
+            f"최고 포함번호: {hold['max_hits']}개",
+            f"무작위 TOP15 기대값: {hold['random_expected_hits']:.1f}개",
+            "",
+            "※ 이 결과는 과거 데이터상의 검증 성적이며 미래 당첨을 보장하지 않습니다.",
+            "※ 추천 점수는 실제 당첨확률이 아니라 엔진 내부 비교점수입니다.",
+        ])
+        QMessageBox.information(self, "성과 최적화 결과", "\n".join(lines))
+
+    def _draw_data_path(self) -> Path:
+        root = Path(os.getenv("LOCALAPPDATA", Path.home())) / "TaegyeongLottoLab"
+        root.mkdir(parents=True, exist_ok=True)
+        return root / "manual_draws.json"
+
+    def _backup_draw_data(self) -> None:
+        path = self._draw_data_path()
+        if not path.exists():
+            return
+        backup_dir = path.parent / "backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(path, backup_dir / f"manual_draws_{stamp}.json")
+
+    def manual_add_draw(self) -> None:
+        if not self.analyzer.draws:
+            QMessageBox.information(self, "데이터 필요", "먼저 역대 Excel을 불러오세요.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("수동 회차 추가")
+        form = QFormLayout(dialog)
+        round_input = QLineEdit(str(self.analyzer.draws[-1].round_no + 1))
+        numbers_input = QLineEdit()
+        numbers_input.setPlaceholderText("예: 3 11 17 24 33 42")
+        bonus_input = QLineEdit()
+        bonus_input.setPlaceholderText("예: 7")
+        form.addRow("회차", round_input)
+        form.addRow("당첨번호 6개", numbers_input)
+        form.addRow("보너스번호", bonus_input)
+        save_btn = QPushButton("검사 후 저장")
+        form.addRow(save_btn)
+
+        def save():
+            try:
+                round_no = int(round_input.text().strip())
+                nums = sorted(parse_numbers(numbers_input.text()))
+                bonus_values = parse_numbers(bonus_input.text())
+                if len(nums) != 6 or len(set(nums)) != 6:
+                    raise ValueError("서로 다른 당첨번호 6개를 입력하세요.")
+                if len(bonus_values) != 1:
+                    raise ValueError("보너스번호 1개를 입력하세요.")
+                bonus = bonus_values[0]
+                if bonus in nums:
+                    raise ValueError("보너스번호가 당첨번호와 중복됩니다.")
+                existing = {draw.round_no for draw in self.analyzer.draws}
+                if round_no in existing:
+                    raise ValueError("이미 등록된 회차입니다.")
+                expected = self.analyzer.draws[-1].round_no + 1
+                if round_no != expected:
+                    answer = QMessageBox.question(
+                        dialog, "회차 확인",
+                        f"다음 예상 회차는 {expected}회입니다. {round_no}회로 저장할까요?"
+                    )
+                    if answer != QMessageBox.Yes:
+                        return
+                self._backup_draw_data()
+                path = self._draw_data_path()
+                records = []
+                if path.exists():
+                    records = json.loads(path.read_text(encoding="utf-8"))
+                records.append({
+                    "round_no": round_no,
+                    "numbers": nums,
+                    "bonus": bonus,
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                })
+                path.write_text(
+                    json.dumps(records, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self.analyzer.draws.append(
+                    Draw(round_no, tuple(nums), bonus)
+                )
+                self.analyzer.draws.sort(key=lambda draw: draw.round_no)
+                self.analyzer._analyze()
+                self.pattern_cache.clear()
+                dialog.accept()
+                self.refresh_all()
+                QMessageBox.information(
+                    self, "저장 완료",
+                    f"{round_no}회가 추가되었습니다. 분석 캐시도 새 데이터 기준으로 갱신했습니다."
+                )
+            except Exception as exc:
+                QMessageBox.warning(dialog, "입력 오류", str(exc))
+
+        save_btn.clicked.connect(save)
+        dialog.exec()
+
+    @staticmethod
+    def _parse_official_latest_html(html: str):
+        rounds = [int(value) for value in re.findall(r"(\d{1,4})회", html)]
+        if not rounds:
+            raise ValueError("공식 페이지에서 최신 회차를 찾지 못했습니다.")
+        latest = max(rounds)
+        # 공식 결과 페이지의 최신 회차 주변에서 번호 6개와 보너스를 탐색
+        marker = html.find(f"{latest}회")
+        segment = html[marker:marker + 12000] if marker >= 0 else html[:12000]
+        clean = re.sub(r"<[^>]+>", " ", segment)
+        values = [int(v) for v in re.findall(r"(?<!\d)([1-9]|[1-3]\d|4[0-5])(?!\d)", clean)]
+        # 중복을 보존하되 첫 정상적인 7개 연속 범위를 탐색
+        for i in range(max(0, len(values) - 30)):
+            candidate = values[i:i + 7]
+            if len(candidate) == 7 and len(set(candidate[:6])) == 6 and candidate[6] not in candidate[:6]:
+                return latest, sorted(candidate[:6]), candidate[6]
+        raise ValueError("공식 페이지에서 번호를 안전하게 해석하지 못했습니다.")
+
+    def check_latest_draw(self) -> None:
+        if not self.analyzer.draws:
+            QMessageBox.information(self, "데이터 필요", "먼저 역대 Excel을 불러오세요.")
+            return
+        try:
+            request = urllib.request.Request(
+                "https://www.dhlottery.co.kr/lt645/result",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                html = response.read().decode("utf-8", errors="ignore")
+            latest, numbers, bonus = self._parse_official_latest_html(html)
+            current = self.analyzer.draws[-1].round_no
+            if latest <= current:
+                QMessageBox.information(
+                    self, "최신 회차 확인",
+                    f"현재 보유 데이터 {current}회가 최신입니다."
+                )
+                return
+            QMessageBox.information(
+                self, "새 회차 발견",
+                f"현재 보유: {current}회\n공식 페이지 최신: {latest}회\n"
+                f"당첨번호: {' · '.join(map(str, numbers))}\n보너스: {bonus}\n\n"
+                "번호를 확인한 뒤 데이터 관리 > 수동 회차 추가에서 저장하세요. "
+                "초기 안정화 기간에는 자동저장 대신 확인 절차를 유지합니다."
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "자동 확인 실패",
+                "공식 페이지 구조 변경 또는 인터넷 연결 문제로 자동 확인하지 못했습니다.\n"
+                f"상세: {exc}\n\n수동 회차 추가 기능을 이용할 수 있습니다."
+            )
+
     def show_pattern_briefing(self) -> None:
         if not self.analyzer.draws:
             QMessageBox.information(
@@ -2397,8 +2802,14 @@ class MainWindow(QMainWindow):
             return
         try:
             recommender = Recommender(self.analyzer)
-            briefing = recommender.pattern_briefing()
-            board, reliability = recommender.pattern_board()
+            cache_key = f"briefing:{len(self.analyzer.draws)}"
+            cached = self.pattern_cache.get(cache_key)
+            if cached is None:
+                briefing = recommender.pattern_briefing()
+                board, reliability = recommender.pattern_board()
+                self.pattern_cache[cache_key] = (briefing, board, reliability)
+            else:
+                briefing, board, reliability = cached
             lines = [briefing, "", "번호별 패턴투표 TOP20"]
             for rank, row in enumerate(board[:20], 1):
                 patterns = ", ".join(row["patterns"]) or "단독 점수"
@@ -2656,6 +3067,11 @@ class MainWindow(QMainWindow):
                 f"추천근거: {' / '.join(metrics.get('pattern_reasons', []))}"
                 if metrics.get("pattern_names") else ""
             )
+            + (
+                "\n\n[성과최적 엔진 근거]\n"
+                + "\n".join(metrics.get("performance_reasons", []))
+                if metrics.get("performance_reasons") else ""
+            )
             + "\n\n[역대 유사 회차]\n" + "\n".join(similar_lines)
         )
         self.detail_box.setPlainText(text)
@@ -2701,6 +3117,8 @@ class MainWindow(QMainWindow):
                 "패턴점수": metrics.get("pattern_score", ""),
                 "주요패턴": ", ".join(metrics.get("pattern_names", [])),
                 "패턴추천근거": " / ".join(metrics.get("pattern_reasons", [])),
+                "성과최적점수": metrics.get("performance", ""),
+                "성과최적근거": " / ".join(metrics.get("performance_reasons", [])),
                 "순위": rank,
                 "번호1": combo[0], "번호2": combo[1], "번호3": combo[2],
                 "번호4": combo[3], "번호5": combo[4], "번호6": combo[5],

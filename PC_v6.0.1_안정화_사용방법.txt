@@ -1,0 +1,32 @@
+﻿太炅 Lotto Lab Ultimate PC v6.0.1 안정화판
+
+수정 내용
+
+1. 특이패턴 오류 수정
+- name 'defaultdict' is not defined 오류 해결
+- 특이패턴추천 정상 실행
+- 이번 주 패턴 브리핑 정상 실행
+- 패턴투표 정상 실행
+
+2. 패턴 계산 안정화
+- 같은 역대 Excel 데이터에서는 패턴 브리핑 결과를 캐시에 저장
+- 같은 계산을 반복하지 않아 재실행 속도 개선
+- 새 Excel을 불러오면 패턴 캐시 자동 초기화
+
+3. 기존 기능 유지
+- 특이패턴추천
+- 통합데이터추천
+- 추천 전략 6종
+- 전략 배틀
+- 필수번호·제외번호·후보번호
+- 추천 이유·신뢰도·등급
+- TOP10·상세분석·역대 유사회차
+- 사진 OCR 속도 개선
+- Excel 저장
+
+업데이트 순서
+1. ZIP 압축을 풉니다.
+2. GitHub 저장소의 Windows 폴더를 덮어씁니다.
+3. .github/workflows/windows-build.yml을 덮어씁니다.
+4. Commit changes를 누릅니다.
+5. Actions에서 Windows EXE 자동 빌드가 초록색으로 완료되면 Artifacts에서 받습니다.
