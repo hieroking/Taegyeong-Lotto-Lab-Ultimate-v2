@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "太炅 Lotto Lab Ultimate"
-VERSION = "7.0.0"
+VERSION = "7.0.3"
 
 
 
@@ -762,7 +762,7 @@ class Recommender:
         excluded_numbers: tuple[int, ...] = (),
         candidate_numbers: tuple[int, ...] = (),
     ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
-        """입력번호와 최근 100·500·1000회 데이터를 실제 추천점수에 혼합합니다."""
+        """입력번호와 최근 100·500·1000회 데이터를 프리셋별로 다르게 결합합니다."""
         if len(source_weights) < 6:
             raise ValueError("통합데이터추천은 입력번호가 최소 6개 필요합니다.")
 
@@ -770,11 +770,11 @@ class Recommender:
         excluded_set = set(excluded_numbers)
         candidate_set = set(candidate_numbers)
 
-        if preset == "자동최적형":
-            applied_preset = self._auto_mixed_preset(source_weights)
-        else:
-            applied_preset = preset
-
+        applied_preset = (
+            self._auto_mixed_preset(source_weights)
+            if preset == "자동최적형"
+            else preset
+        )
         input_w, w100, w500, w1000 = self.MIXED_PRESETS.get(
             applied_preset,
             self.MIXED_PRESETS["균형형"],
@@ -787,45 +787,74 @@ class Recommender:
         }
 
         max_input = max(source_weights.values(), default=1)
-        number_blend = {}
-        for number in range(1, 46):
-            input_score = source_weights[number] / max_input * 100
-            window_scores = []
-            for size in (100, 500, 1000):
-                analyzer = analyzers[size]
-                max_count = max(analyzer.number_counts.values(), default=1)
-                window_scores.append(
-                    analyzer.number_counts[number] / max_count * 100
-                )
-            number_blend[number] = (
-                input_score * input_w
-                + window_scores[0] * w100
-                + window_scores[1] * w500
-                + window_scores[2] * w1000
+        input_scores = {
+            n: source_weights[n] / max_input * 100.0
+            for n in range(1, 46)
+        }
+
+        window_scores = {}
+        for size, analyzer in analyzers.items():
+            max_count = max(analyzer.number_counts.values(), default=1)
+            window_scores[size] = {
+                n: analyzer.number_counts[n] / max_count * 100.0
+                for n in range(1, 46)
+            }
+
+        combined = {
+            n: (
+                input_scores[n] * input_w
+                + window_scores[100][n] * w100
+                + window_scores[500][n] * w500
+                + window_scores[1000][n] * w1000
             )
+            for n in range(1, 46)
+        }
 
-        ranked = [
-            number for number, _ in sorted(
-                number_blend.items(),
-                key=lambda item: (-item[1], item[0]),
-            )
-            if number not in excluded_set
-        ]
+        ranked_input = sorted(range(1, 46), key=lambda n: (-input_scores[n], n))
+        ranked100 = sorted(range(1, 46), key=lambda n: (-window_scores[100][n], n))
+        ranked500 = sorted(range(1, 46), key=lambda n: (-window_scores[500][n], n))
+        ranked1000 = sorted(range(1, 46), key=lambda n: (-window_scores[1000][n], n))
+        ranked_combined = sorted(range(1, 46), key=lambda n: (-combined[n], n))
 
-        # 입력번호는 우선 보존하고, 역사 데이터 상위번호로 후보군을 확장합니다.
-        pool = list(dict.fromkeys(
-            list(source_weights.keys()) + ranked + list(fixed_set | candidate_set)
-        ))
-        pool = [n for n in pool if n not in excluded_set]
+        pool_plan = {
+            "입력중심형": (10, 4, 2, 2),
+            "최근중심형": (6, 7, 3, 2),
+            "균형형": (6, 4, 4, 4),
+            "장기형": (4, 2, 5, 7),
+        }
+        input_n, n100, n500, n1000 = pool_plan.get(
+            applied_preset,
+            pool_plan["균형형"],
+        )
 
-        mandatory = list(fixed_set | candidate_set)
-        selected = []
-        for number in mandatory + pool:
-            if number not in selected:
-                selected.append(number)
-            if len(selected) >= 18:
+        pool = []
+        for number in list(fixed_set | candidate_set):
+            if number not in excluded_set and number not in pool:
+                pool.append(number)
+
+        for ranked_source, limit in (
+            (ranked_input, input_n),
+            (ranked100, n100),
+            (ranked500, n500),
+            (ranked1000, n1000),
+        ):
+            added = 0
+            for number in ranked_source:
+                if number in excluded_set or number in pool:
+                    continue
+                pool.append(number)
+                added += 1
+                if added >= limit:
+                    break
+
+        for number in ranked_combined:
+            if number in excluded_set or number in pool:
+                continue
+            pool.append(number)
+            if len(pool) >= 18:
                 break
-        pool = sorted(selected)
+
+        pool = sorted(pool[:18])
 
         candidates = []
         for combo in combinations(pool, 6):
@@ -836,17 +865,22 @@ class Recommender:
                 continue
             if combo in self.a.first_prize or combo in self.a.second_prize:
                 continue
-            if not 20 <= sum(combo) <= 300:
+            if not 85 <= sum(combo) <= 200:
                 continue
 
-            base_metrics = dict(self.metrics(combo, source_weights))
-            input_score = base_metrics["input"]
+            odd = sum(n % 2 for n in combo)
+            high = sum(n >= 23 for n in combo)
+            if odd not in (2, 3, 4) or high not in (2, 3, 4):
+                continue
+
+            metrics = dict(self.metrics(combo, source_weights))
             score100 = self._historical_combo_score(combo, analyzers[100])
             score500 = self._historical_combo_score(combo, analyzers[500])
             score1000 = self._historical_combo_score(combo, analyzers[1000])
-
+            input_score = metrics["input"]
             candidate_hits = len(combo_set & candidate_set)
             candidate_bonus = min(12.0, candidate_hits * 4.0)
+
             mixed_score = (
                 input_score * input_w
                 + score100 * w100
@@ -855,13 +889,18 @@ class Recommender:
                 + candidate_bonus
             )
 
-            base_metrics.update({
+            metrics.update({
                 "mixed": mixed_score,
                 "mixed_preset": applied_preset,
                 "mixed_input_weight": input_w,
                 "mixed_100_weight": w100,
                 "mixed_500_weight": w500,
                 "mixed_1000_weight": w1000,
+                "mixed_candidate_pool": pool,
+                "mixed_top_input": ranked_input[:10],
+                "mixed_top_100": ranked100[:10],
+                "mixed_top_500": ranked500[:10],
+                "mixed_top_1000": ranked1000[:10],
                 "score100": score100,
                 "score500": score500,
                 "score1000": score1000,
@@ -869,7 +908,7 @@ class Recommender:
                 "candidate_bonus": candidate_bonus,
                 "strategy": f"통합-{applied_preset}",
             })
-            candidates.append((mixed_score, combo, base_metrics))
+            candidates.append((mixed_score, combo, metrics))
 
         candidates.sort(key=lambda row: (-row[0], row[1]))
         return self.select_diverse(candidates, count)
@@ -1323,23 +1362,61 @@ class Recommender:
     def generate_self(
         self,
         count: int = 100,
+        mode: str = "자동종합",
     ) -> list[tuple[float, tuple[int, ...], dict[str, float]]]:
-        """사진·직접입력 없이 역대 전체 당첨번호만으로 추천합니다."""
-        number_scores = self.self_number_scores()
+        """역대 전체 데이터와 선택한 특이패턴을 결합해 자체추천합니다."""
+        base_scores = self.self_number_scores()
+        pattern_scores, pattern_reasons = self._pattern_number_scores(self.a.draws)
+        reliability = self.pattern_reliability(self.a.draws)
 
-        # 45개 전체 조합(약 814만 개)은 느리므로 자체 점수 상위 28개를 우선 탐색합니다.
-        # 구간 다양성을 위해 각 10번대 구간의 강한 번호도 포함합니다.
+        # 선택 패턴이 실제 번호점수와 후보 풀에 반영되도록 구성합니다.
+        selected_scores: dict[int, float] = {}
+        if mode == "자동종합":
+            for number in range(1, 46):
+                weighted = 0.0
+                weight_sum = 0.0
+                for pattern_name in self.PATTERN_NAMES:
+                    rel = reliability.get(pattern_name, 50.0)
+                    weighted += pattern_scores[pattern_name][number] * rel
+                    weight_sum += rel
+                selected_scores[number] = weighted / max(1.0, weight_sum)
+            pattern_mix = 0.48
+        elif mode in pattern_scores:
+            selected_scores = dict(pattern_scores[mode])
+            pattern_mix = 0.68
+        else:
+            selected_scores = {number: 0.0 for number in range(1, 46)}
+            pattern_mix = 0.0
+
+        number_scores = {
+            number: (
+                base_scores[number] * (1.0 - pattern_mix)
+                + selected_scores[number] * pattern_mix
+            )
+            for number in range(1, 46)
+        }
+
         ranked = sorted(number_scores, key=lambda n: (-number_scores[n], n))
-        pool = set(ranked[:24])
-        for low, high in [(1, 10), (11, 20), (21, 30), (31, 40), (41, 45)]:
-            zone = [n for n in ranked if low <= n <= high][:2]
-            pool.update(zone)
+        pattern_ranked = sorted(
+            selected_scores, key=lambda n: (-selected_scores[n], n)
+        )
 
-        # 최대 28개로 제한
-        pool = sorted(pool, key=lambda n: (-number_scores[n], n))[:28]
+        # 선택한 패턴의 상위 번호를 후보번호 풀에 직접 포함합니다.
+        pool = set(ranked[:18])
+        pool.update(pattern_ranked[:10])
+        for low, high in [(1, 10), (11, 20), (21, 30), (31, 40), (41, 45)]:
+            pool.update([n for n in ranked if low <= n <= high][:1])
+            pool.update([n for n in pattern_ranked if low <= n <= high][:1])
+
+        pool = sorted(
+            pool,
+            key=lambda n: (
+                -(number_scores[n] * 0.55 + selected_scores[n] * 0.45),
+                n,
+            ),
+        )[:28]
         pool = sorted(pool)
 
-        # metrics()의 나온횟수 점수를 역대 출현빈도로 계산하기 위한 가중치
         historical_weights = Counter({
             n: max(1, self.a.number_counts[n])
             for n in range(1, 46)
@@ -1362,15 +1439,31 @@ class Recommender:
 
             metrics = self.metrics(combo, historical_weights)
             own_number_score = sum(number_scores[n] for n in combo) / 6.0
+            selected_pattern_score = sum(selected_scores[n] for n in combo) / 6.0
 
-            # 자체추천 최종 점수: 번호 자체점수와 조합 통계의 자동 종합
-            self_score = own_number_score * 0.45 + metrics["composite"] * 0.55
+            # 선택 패턴은 번호 후보 선정뿐 아니라 최종 조합 순위에도 직접 반영합니다.
+            self_score = (
+                own_number_score * 0.34
+                + metrics["composite"] * 0.33
+                + selected_pattern_score * 0.33
+            )
             metrics = dict(metrics)
             metrics["self"] = self_score
+            metrics["self_pattern_mode"] = mode
+            metrics["self_pattern_score"] = selected_pattern_score
+            metrics["pattern_names"] = [mode] if mode != "자동종합" else ["자동종합"]
+            metrics["pattern_reasons"] = list(dict.fromkeys(
+                reason
+                for number in combo
+                for reason in pattern_reasons.get(number, [])
+            ))[:5]
+            metrics["self_pattern_mix"] = pattern_mix
+            metrics["self_candidate_pool"] = pool
+            metrics["self_pattern_top10"] = pattern_ranked[:10]
             candidates.append((self_score, combo, metrics))
 
         candidates.sort(key=lambda x: (-x[0], x[1]))
-        return candidates[:count]
+        return self.select_diverse(candidates, count)
 
     def select_pool(
         self,
@@ -1703,7 +1796,8 @@ class MainWindow(QMainWindow):
 
         self.make_menu()
         self.apply_theme()
-        self.statusBar().showMessage("역대 로또 Excel 파일을 불러오세요.")
+        self.statusBar().showMessage("이전 작업상태를 확인하고 있습니다...")
+        self.restore_session()
 
     def make_sidebar(self) -> QWidget:
         box = QFrame()
@@ -1754,6 +1848,23 @@ class MainWindow(QMainWindow):
         export_action = QAction("추천 결과 Excel 저장", self)
         export_action.triggered.connect(self.export_results)
         menu.addAction(export_action)
+
+        data_menu = self.menuBar().addMenu("데이터 관리")
+        manual_action = QAction("수동 회차 추가", self)
+        manual_action.triggered.connect(self.manual_add_draw)
+        data_menu.addAction(manual_action)
+
+        latest_action = QAction("최신 회차 자동 확인", self)
+        latest_action.triggered.connect(self.check_latest_draw)
+        data_menu.addAction(latest_action)
+
+        performance_action = QAction("성과 최적화 결과", self)
+        performance_action.triggered.connect(self.show_performance_report)
+        data_menu.addAction(performance_action)
+
+        save_action = QAction("현재 상태 저장", self)
+        save_action.triggered.connect(self.save_session)
+        data_menu.addAction(save_action)
 
     def make_dashboard(self) -> QWidget:
         p = QWidget()
@@ -1901,7 +2012,7 @@ class MainWindow(QMainWindow):
             "사진 또는 직접 입력한 번호를 기준으로 자동 계산합니다.\n"
             "추천 100조합 · 역대 1등·2등 동일 조합 제외\n"
             "특이패턴추천은 이월수·재등장·강세·미출현·끝수·연속수·동반수·간격수의 번호를 투표식으로 종합합니다.\n"
-            "자체추천은 사진이나 직접입력 없이 역대 전체 당첨번호만으로 계산합니다."
+            "자체추천은 역대 전체 데이터에 선택한 특이패턴을 실제 반영해 계산합니다."
         )
         guide.setObjectName("card")
         guide.setWordWrap(True)
@@ -1939,7 +2050,7 @@ class MainWindow(QMainWindow):
             ["입력중심형", "최근중심형", "균형형", "장기형", "자동최적형"]
         )
         self.mixed_preset_combo.currentTextChanged.connect(
-            self.generate_recommendations
+            self.on_mixed_preset_changed
         )
         mixed_row.addWidget(mixed_label)
         mixed_row.addWidget(self.mixed_preset_combo)
@@ -1961,7 +2072,7 @@ class MainWindow(QMainWindow):
             ]
         )
         self.pattern_mode_combo.currentTextChanged.connect(
-            self.generate_recommendations
+            self.on_pattern_mode_changed
         )
         pattern_row.addWidget(pattern_label)
         pattern_row.addWidget(self.pattern_mode_combo)
@@ -2014,6 +2125,190 @@ class MainWindow(QMainWindow):
         lay.addWidget(export)
         return p
 
+    def _app_data_dir(self) -> Path:
+        root = Path(os.getenv("LOCALAPPDATA", Path.home())) / "TaegyeongLottoLab"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _session_path(self) -> Path:
+        return self._app_data_dir() / "last_session.json"
+
+    def _merge_manual_draws(self) -> int:
+        path = self._draw_data_path()
+        if not path.exists() or not self.analyzer.draws:
+            return 0
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+
+        existing = {draw.round_no for draw in self.analyzer.draws}
+        added = 0
+        for record in records:
+            try:
+                round_no = int(record["round_no"])
+                numbers = tuple(sorted(int(n) for n in record["numbers"]))
+                bonus = int(record["bonus"]) if record.get("bonus") is not None else None
+                if round_no in existing:
+                    continue
+                if len(numbers) != 6 or len(set(numbers)) != 6:
+                    continue
+                if any(not 1 <= n <= 45 for n in numbers):
+                    continue
+                if bonus is not None and (not 1 <= bonus <= 45 or bonus in numbers):
+                    continue
+                self.analyzer.draws.append(Draw(round_no, numbers, bonus))
+                existing.add(round_no)
+                added += 1
+            except Exception:
+                continue
+
+        if added:
+            self.analyzer.draws.sort(key=lambda draw: draw.round_no)
+            self.analyzer._analyze()
+            self.pattern_cache.clear()
+        return added
+
+    def save_session(self) -> None:
+        try:
+            state = {
+                "excel_path": getattr(self, "current_excel_path", ""),
+                "source_input": self.source_input.toPlainText(),
+                "fixed_input": self.fixed_input.text(),
+                "excluded_input": self.excluded_input.text(),
+                "candidate_input": self.candidate_input.text(),
+                "photo_paths": [path for path in self.photo_paths if Path(path).exists()],
+                "rec_category": self.rec_category.currentText(),
+                "strategy": self.strategy_combo.currentText(),
+                "mixed_preset": self.mixed_preset_combo.currentText(),
+                "pattern_mode": self.pattern_mode_combo.currentText(),
+                "round_search": self.round_search_input.text(),
+                "stack_index": self.stack.currentIndex(),
+                "window": {
+                    "x": self.x(),
+                    "y": self.y(),
+                    "width": self.width(),
+                    "height": self.height(),
+                },
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            path = self._session_path()
+            temp_path = path.with_suffix(".tmp")
+            temp_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+            self.statusBar().showMessage("현재 작업상태가 저장되었습니다.", 3000)
+        except Exception as exc:
+            self.statusBar().showMessage(f"상태 저장 실패: {exc}", 5000)
+
+    @staticmethod
+    def _set_combo_text(combo: QComboBox, text: str) -> None:
+        index = combo.findText(text)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def restore_session(self) -> None:
+        path = self._session_path()
+        if not path.exists():
+            self.statusBar().showMessage("역대 로또 Excel 파일을 불러오세요.")
+            return
+
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.statusBar().showMessage(f"이전 상태를 읽지 못했습니다: {exc}")
+            return
+
+        self.suspend_auto_recommend = True
+        widgets = [
+            self.rec_category,
+            self.strategy_combo,
+            self.mixed_preset_combo,
+            self.pattern_mode_combo,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+
+        try:
+            self.source_input.setPlainText(state.get("source_input", ""))
+            self.fixed_input.setText(state.get("fixed_input", ""))
+            self.excluded_input.setText(state.get("excluded_input", ""))
+            self.candidate_input.setText(state.get("candidate_input", ""))
+            self.round_search_input.setText(state.get("round_search", ""))
+
+            self._set_combo_text(
+                self.rec_category, state.get("rec_category", "자체추천")
+            )
+            self._set_combo_text(
+                self.strategy_combo, state.get("strategy", "균형형")
+            )
+            self._set_combo_text(
+                self.mixed_preset_combo, state.get("mixed_preset", "균형형")
+            )
+            self._set_combo_text(
+                self.pattern_mode_combo, state.get("pattern_mode", "자동종합")
+            )
+
+            self.photo_paths = [
+                path for path in state.get("photo_paths", [])
+                if Path(path).exists()
+            ]
+            self.photo_list.clear()
+            for photo_path in self.photo_paths:
+                self.photo_list.addItem(Path(photo_path).name)
+
+            window = state.get("window", {})
+            width = max(1100, int(window.get("width", 1320)))
+            height = max(700, int(window.get("height", 850)))
+            self.resize(width, height)
+            if "x" in window and "y" in window:
+                self.move(int(window["x"]), int(window["y"]))
+
+            stack_index = int(state.get("stack_index", 0))
+            if 0 <= stack_index < self.stack.count():
+                self.stack.setCurrentIndex(stack_index)
+
+            excel_path = state.get("excel_path", "")
+            if excel_path and Path(excel_path).exists():
+                self.current_excel_path = excel_path
+                self.excel_progress.setValue(15)
+                self.excel_status.setText(
+                    f"이전 Excel 자동 복원 중: {Path(excel_path).name}"
+                )
+                QApplication.processEvents()
+                self.analyzer.load_excel(excel_path)
+                merged = self._merge_manual_draws()
+                latest = self.analyzer.draws[-1].round_no
+                self.excel_progress.setValue(100)
+                self.excel_status.setText(
+                    f"이전 Excel 자동 복원 완료: {Path(excel_path).name}\n"
+                    f"분석 회차 {len(self.analyzer.draws):,}개 · 최신 {latest}회"
+                    + (f" · 수동 추가 {merged}개 병합" if merged else "")
+                )
+                self.update_source_counts()
+                self.statusBar().showMessage(
+                    f"이전 작업상태 복원 완료 · 최신 {latest}회"
+                )
+            else:
+                self.statusBar().showMessage(
+                    "입력값과 설정은 복원했지만 이전 Excel 파일을 찾지 못했습니다."
+                )
+        except Exception as exc:
+            self.statusBar().showMessage(f"이전 상태 복원 중 오류: {exc}", 7000)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+            self.suspend_auto_recommend = False
+
+        if self.analyzer.draws:
+            self.generate_recommendations()
+
+    def closeEvent(self, event) -> None:
+        self.save_session()
+        event.accept()
+
     def show_recommend_category(self, category: str) -> None:
         self.stack.setCurrentIndex(1)
         index = self.rec_category.findText(category)
@@ -2040,6 +2335,8 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
             self.analyzer.load_excel(path)
+            self.current_excel_path = path
+            merged_manual = self._merge_manual_draws()
             self.pattern_cache.clear()
 
             self.excel_progress.setValue(75)
@@ -2050,12 +2347,14 @@ class MainWindow(QMainWindow):
                 f"Excel 등록 완료: {Path(path).name}\n"
                 f"분석 회차 {len(self.analyzer.draws):,}개 · 최신 {latest}회 · "
                 f"1등 조합 {len(self.analyzer.first_prize):,}개"
+                + (f" · 수동 추가 {merged_manual}개 병합" if merged_manual else "")
             )
             self.excel_progress.setValue(100)
 
             # Excel만으로 계산 가능한 자체추천을 즉시 실행
             self.statusBar().showMessage("Excel 분석 완료 — 자체추천 계산 중...")
             self.show_recommend_category("자체추천")
+            self.save_session()
 
             # 사진/직접입력 번호가 이미 있다면 다른 5개 항목도 사용할 수 있음을 표시
             try:
@@ -2401,13 +2700,19 @@ class MainWindow(QMainWindow):
             category = self.rec_category.currentText()
 
             if category == "자체추천":
-                self.statusBar().showMessage("역대 전체 데이터로 자체추천 100조합 계산 중...")
+                mode = self.pattern_mode_combo.currentText()
+                self.statusBar().showMessage(
+                    f"역대 전체 데이터 + {mode} 패턴으로 자체추천 100조합 계산 중..."
+                )
+                self.rec_status.setText(
+                    f"자체추천 계산 중 · 선택 패턴 {mode}가 후보번호와 조합점수에 반영됩니다."
+                )
                 QApplication.processEvents()
-                self.recommendations = recommender.generate_self(100)
+                self.recommendations = recommender.generate_self(100, mode=mode)
                 fixed_numbers = ()
                 excluded_numbers = ()
                 candidate_numbers = ()
-                strategy = "자체추천"
+                strategy = f"자체추천-{mode}"
             elif category == "성과최적추천":
                 fixed_numbers = self.fixed_numbers()
                 excluded_numbers = self.excluded_numbers()
@@ -2606,7 +2911,23 @@ class MainWindow(QMainWindow):
 
             self.rec_table.resizeColumnsToContents()
             if category == "자체추천":
-                filter_text = "역대 전체 데이터 자동분석"
+                first_metrics = self.recommendations[0][2]
+                filter_text = (
+                    f"현재패턴 {first_metrics.get('self_pattern_mode', '')} · "
+                    f"패턴비중 {first_metrics.get('self_pattern_mix', 0) * 100:.0f}% · "
+                    f"패턴TOP10 {' · '.join(map(str, first_metrics.get('self_pattern_top10', [])))} · "
+                    f"후보풀 {' · '.join(map(str, first_metrics.get('self_candidate_pool', [])))}"
+                )
+            elif category == "통합데이터추천":
+                first_metrics = self.recommendations[0][2]
+                filter_text = (
+                    f"프리셋 {first_metrics.get('mixed_preset', '')} · "
+                    f"입력 {first_metrics.get('mixed_input_weight', 0) * 100:.0f}% / "
+                    f"최근100 {first_metrics.get('mixed_100_weight', 0) * 100:.0f}% / "
+                    f"최근500 {first_metrics.get('mixed_500_weight', 0) * 100:.0f}% / "
+                    f"최근1000 {first_metrics.get('mixed_1000_weight', 0) * 100:.0f}% · "
+                    f"후보풀 {' · '.join(map(str, first_metrics.get('mixed_candidate_pool', [])))}"
+                )
             else:
                 mode_values = {
                     str(row_metrics.get("filter_mode", "자동"))
@@ -2616,7 +2937,7 @@ class MainWindow(QMainWindow):
 
             self.rec_status.setText(
                 f"{category} 기준 {len(self.recommendations)}조합 계산 완료 · "
-                f"적용 필터: {filter_text} · 유사조합 자동분산 적용"
+                f"{filter_text} · 유사조합 자동분산 적용"
             )
             self.statusBar().showMessage(
                 f"{category} 추천 {len(self.recommendations)}개 완료"
@@ -2625,6 +2946,44 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "추천 오류", str(e))
 
 
+
+    def on_mixed_preset_changed(self, preset: str) -> None:
+        self.recommendations = []
+        if hasattr(self, "rec_table"):
+            self.rec_table.setRowCount(0)
+        self.rec_status.setText(
+            f"통합데이터 설정 변경: {preset} · 후보번호와 추천조합을 다시 계산합니다."
+        )
+        self.statusBar().showMessage(
+            f"{preset} 적용 중 · 이전 통합추천 결과를 재사용하지 않습니다."
+        )
+        if self.suspend_auto_recommend or not self.analyzer.draws:
+            return
+        if self.rec_category.currentText() == "통합데이터추천":
+            QApplication.processEvents()
+            self.generate_recommendations()
+        else:
+            self.save_session()
+
+    def on_pattern_mode_changed(self, mode: str) -> None:
+        """패턴 변경 시 기존 결과를 폐기하고 새 조합을 강제로 계산합니다."""
+        self.pattern_cache.clear()
+        self.recommendations = []
+        if hasattr(self, "rec_table"):
+            self.rec_table.setRowCount(0)
+        self.rec_status.setText(
+            f"패턴 변경: {mode} · 후보번호와 추천조합을 새로 계산합니다."
+        )
+        self.statusBar().showMessage(
+            f"{mode} 적용 중 · 이전 추천결과를 재사용하지 않습니다."
+        )
+        if self.suspend_auto_recommend or not self.analyzer.draws:
+            return
+        if self.rec_category.currentText() in ("자체추천", "특이패턴추천"):
+            QApplication.processEvents()
+            self.generate_recommendations()
+        else:
+            self.save_session()
 
     def show_performance_report(self) -> None:
         result = TKPerformanceEngine.OPTIMIZATION_RESULT
@@ -2733,6 +3092,7 @@ class MainWindow(QMainWindow):
                 self.pattern_cache.clear()
                 dialog.accept()
                 self.refresh_all()
+                self.save_session()
                 QMessageBox.information(
                     self, "저장 완료",
                     f"{round_no}회가 추가되었습니다. 분석 캐시도 새 데이터 기준으로 갱신했습니다."
@@ -2763,7 +3123,9 @@ class MainWindow(QMainWindow):
 
     def check_latest_draw(self) -> None:
         if not self.analyzer.draws:
-            QMessageBox.information(self, "데이터 필요", "먼저 역대 Excel을 불러오세요.")
+            QMessageBox.information(
+                self, "데이터 필요", "먼저 역대 Excel을 불러오세요."
+            )
             return
         try:
             request = urllib.request.Request(
@@ -2772,6 +3134,7 @@ class MainWindow(QMainWindow):
             )
             with urllib.request.urlopen(request, timeout=15) as response:
                 html = response.read().decode("utf-8", errors="ignore")
+
             latest, numbers, bonus = self._parse_official_latest_html(html)
             current = self.analyzer.draws[-1].round_no
             if latest <= current:
@@ -2780,18 +3143,87 @@ class MainWindow(QMainWindow):
                     f"현재 보유 데이터 {current}회가 최신입니다."
                 )
                 return
-            QMessageBox.information(
-                self, "새 회차 발견",
-                f"현재 보유: {current}회\n공식 페이지 최신: {latest}회\n"
-                f"당첨번호: {' · '.join(map(str, numbers))}\n보너스: {bonus}\n\n"
-                "번호를 확인한 뒤 데이터 관리 > 수동 회차 추가에서 저장하세요. "
-                "초기 안정화 기간에는 자동저장 대신 확인 절차를 유지합니다."
+
+            answer = QMessageBox.question(
+                self,
+                "새 회차 발견",
+                f"현재 보유: {current}회\n"
+                f"공식 최신: {latest}회\n"
+                f"당첨번호: {' · '.join(map(str, numbers))}\n"
+                f"보너스번호: {bonus}\n\n"
+                "확인한 번호를 바로 업데이트할까요?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
             )
+            if answer != QMessageBox.Yes:
+                return
+
+            if latest in {draw.round_no for draw in self.analyzer.draws}:
+                QMessageBox.information(
+                    self, "중복 회차", f"{latest}회는 이미 등록되어 있습니다."
+                )
+                return
+
+            expected = current + 1
+            if latest != expected:
+                confirm = QMessageBox.question(
+                    self,
+                    "회차 누락 경고",
+                    f"다음 예상 회차는 {expected}회지만 최신 회차는 {latest}회입니다.\n"
+                    "그래도 추가할까요?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if confirm != QMessageBox.Yes:
+                    return
+
+            self._backup_draw_data()
+            path = self._draw_data_path()
+            records = []
+            if path.exists():
+                try:
+                    records = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    records = []
+
+            if not any(int(r.get("round_no", -1)) == latest for r in records):
+                records.append({
+                    "round_no": latest,
+                    "numbers": numbers,
+                    "bonus": bonus,
+                    "source": "official_auto_check",
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                })
+                path.write_text(
+                    json.dumps(records, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+            self.analyzer.draws.append(Draw(latest, tuple(numbers), bonus))
+            self.analyzer.draws.sort(key=lambda draw: draw.round_no)
+            self.analyzer._analyze()
+            self.pattern_cache.clear()
+            self.recommendations = []
+            self.update_source_counts()
+            self.save_session()
+
+            QMessageBox.information(
+                self,
+                "업데이트 완료",
+                f"{latest}회가 저장되었습니다.\n"
+                f"당첨번호: {' · '.join(map(str, numbers))}\n"
+                f"보너스번호: {bonus}\n\n"
+                "전체 통계와 추천엔진이 새 회차 기준으로 갱신되었습니다."
+            )
+            self.generate_recommendations()
+
         except Exception as exc:
             QMessageBox.warning(
-                self, "자동 확인 실패",
+                self,
+                "자동 확인 실패",
                 "공식 페이지 구조 변경 또는 인터넷 연결 문제로 자동 확인하지 못했습니다.\n"
-                f"상세: {exc}\n\n수동 회차 추가 기능을 이용할 수 있습니다."
+                f"상세: {exc}\n\n"
+                "데이터 관리 > 수동 회차 추가를 이용하세요."
             )
 
     def show_pattern_briefing(self) -> None:
@@ -3068,6 +3500,14 @@ class MainWindow(QMainWindow):
                 if metrics.get("pattern_names") else ""
             )
             + (
+                "\n\n[자체추천 패턴 적용]\n"
+                f"현재패턴: {metrics.get('self_pattern_mode', '')}\n"
+                f"패턴비중: {metrics.get('self_pattern_mix', 0) * 100:.0f}%\n"
+                f"패턴TOP10: {' · '.join(map(str, metrics.get('self_pattern_top10', [])))}\n"
+                f"후보번호풀: {' · '.join(map(str, metrics.get('self_candidate_pool', [])))}"
+                if metrics.get("self_pattern_mode") else ""
+            )
+            + (
                 "\n\n[성과최적 엔진 근거]\n"
                 + "\n".join(metrics.get("performance_reasons", []))
                 if metrics.get("performance_reasons") else ""
@@ -3112,11 +3552,21 @@ class MainWindow(QMainWindow):
                 "최근100회비중": metrics.get("mixed_100_weight", ""),
                 "최근500회비중": metrics.get("mixed_500_weight", ""),
                 "최근1000회비중": metrics.get("mixed_1000_weight", ""),
+                "통합데이터후보풀": ", ".join(map(str, metrics.get("mixed_candidate_pool", []))),
+                "통합입력TOP10": ", ".join(map(str, metrics.get("mixed_top_input", []))),
+                "통합최근100TOP10": ", ".join(map(str, metrics.get("mixed_top_100", []))),
+                "통합최근500TOP10": ", ".join(map(str, metrics.get("mixed_top_500", []))),
+                "통합최근1000TOP10": ", ".join(map(str, metrics.get("mixed_top_1000", []))),
                 "패턴모드": metrics.get("pattern_mode", ""),
                 "패턴투표수": metrics.get("pattern_votes", ""),
                 "패턴점수": metrics.get("pattern_score", ""),
                 "주요패턴": ", ".join(metrics.get("pattern_names", [])),
                 "패턴추천근거": " / ".join(metrics.get("pattern_reasons", [])),
+                "자체추천패턴": metrics.get("self_pattern_mode", ""),
+                "자체추천패턴점수": metrics.get("self_pattern_score", ""),
+                "자체추천패턴비중": metrics.get("self_pattern_mix", ""),
+                "자체추천패턴TOP10": ", ".join(map(str, metrics.get("self_pattern_top10", []))),
+                "자체추천후보풀": ", ".join(map(str, metrics.get("self_candidate_pool", []))),
                 "성과최적점수": metrics.get("performance", ""),
                 "성과최적근거": " / ".join(metrics.get("performance_reasons", [])),
                 "순위": rank,
